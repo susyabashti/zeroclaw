@@ -286,6 +286,7 @@ pub enum ConfigTab {
     Tuning,
     Workspace,
     Memory,
+    EnvironmentVariables,
 
     // ── Agents: composite (custom-component) tabs ──
     PeerGroups,
@@ -321,6 +322,7 @@ impl ConfigTab {
             Self::Tuning => "Tuning",
             Self::Workspace => "Workspace",
             Self::Memory => "Memory",
+            Self::EnvironmentVariables => "Env Variables",
             Self::PeerGroups => "Peer Groups",
             Self::Personality => "Personality",
             Self::Settings => "Settings",

@@ -829,8 +829,15 @@ pub async fn run_gateway(
 
     let (mut tools_registry_raw, delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
+            let agent_env = config
+                .agents
+                .get(agent_alias)
+                .map(|a| a.env.clone())
+                .unwrap_or_default();
+
             let all_tools_result = tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
+                agent_env,
                 &security,
                 &risk_profile,
                 agent_alias,

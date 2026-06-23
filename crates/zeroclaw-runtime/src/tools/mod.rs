@@ -245,12 +245,16 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
 }
 
 /// Create the default tool registry
-pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
-    default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
+pub fn default_tools(
+    agent_env: HashMap<String, String>,
+    security: Arc<SecurityPolicy>,
+) -> Vec<Box<dyn Tool>> {
+    default_tools_with_runtime(agent_env, security, Arc::new(NativeRuntime::new()))
 }
 
 /// Create the default tool registry with explicit runtime adapter.
 pub fn default_tools_with_runtime(
+    agent_env: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
@@ -258,7 +262,8 @@ pub fn default_tools_with_runtime(
     vec![
         Box::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                ShellTool::new(security.clone(), runtime).with_persistent_writes(persistent_writes),
+                ShellTool::new(agent_env, security.clone(), runtime)
+                    .with_persistent_writes(persistent_writes),
                 security.clone(),
             ),
             security.clone(),
@@ -451,6 +456,7 @@ pub struct AllToolsResult {
 )]
 pub fn all_tools(
     config: Arc<Config>,
+    agent_env: HashMap<String, String>,
     security: &Arc<SecurityPolicy>,
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
     agent_alias: &str,
@@ -470,6 +476,7 @@ pub fn all_tools(
 ) -> AllToolsResult {
     all_tools_with_runtime(
         config,
+        agent_env,
         security,
         risk_profile,
         agent_alias,
@@ -500,6 +507,7 @@ pub fn all_tools(
 )]
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
+    agent_env: HashMap<String, String>,
     security: &Arc<SecurityPolicy>,
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
     agent_alias: &str,
@@ -528,7 +536,7 @@ pub fn all_tools_with_runtime(
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+                ShellTool::new_with_sandbox(agent_env, security.clone(), runtime, sandbox)
                     .with_timeout_secs(if security.shell_timeout_secs > 0 {
                         security.shell_timeout_secs
                     } else {
@@ -1464,10 +1472,17 @@ mod tests {
         }
     }
 
+    fn test_agent_env() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            ("ZEROCLAW_AGENT_ID".to_string(), "test-agent".to_string()),
+            ("CUSTOM_ENV_VAR".to_string(), "test-value".to_string()),
+        ])
+    }
+
     #[test]
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(test_agent_env(), security);
         assert_eq!(tools.len(), 6);
     }
 
@@ -1496,6 +1511,7 @@ mod tests {
 
         let tools = all_tools(
             Arc::new(Config::default()),
+            test_agent_env(),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -1561,6 +1577,7 @@ mod tests {
 
         let tools = all_tools_with_runtime(
             Arc::new(Config::default()),
+            test_agent_env(),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -1630,6 +1647,7 @@ mod tests {
         // RPC sessions from one engine pair.
         let session_a = all_tools_with_runtime(
             Arc::new(Config::default()),
+            test_agent_env(),
             &security,
             &risk,
             "session-a",
@@ -1652,6 +1670,7 @@ mod tests {
         );
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
+            test_agent_env(),
             &security,
             &risk,
             "session-b",
@@ -1732,6 +1751,7 @@ mod tests {
 
         let tools = all_tools_with_runtime(
             Arc::new(config),
+            test_agent_env(),
             &security,
             &risk,
             "test-agent",
@@ -1869,7 +1889,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let runtime: Arc<dyn RuntimeAdapter> = Arc::new(EphemeralRuntime(NativeRuntime::new()));
-        let tools = default_tools_with_runtime(security, runtime);
+        let tools = default_tools_with_runtime(test_agent_env(), security, runtime);
         let by_name = |n: &str| tools.iter().find(|t| t.name() == n).unwrap();
 
         // shell: warns on the executed command.
@@ -1950,6 +1970,7 @@ mod tests {
 
         let tools = all_tools(
             Arc::new(Config::default()),
+            test_agent_env(),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -1998,6 +2019,7 @@ mod tests {
 
         let tools = all_tools(
             Arc::new(Config::default()),
+            test_agent_env(),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -2065,6 +2087,7 @@ mod tests {
             let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(mem.clone()));
             all_tools_with_runtime(
                 Arc::new(Config::default()),
+                test_agent_env(),
                 &security,
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
                 "test-agent",
@@ -2109,7 +2132,7 @@ mod tests {
     #[test]
     fn default_tools_names() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(test_agent_env(), security);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
@@ -2122,7 +2145,7 @@ mod tests {
     #[test]
     fn default_tools_all_have_descriptions() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(test_agent_env(), security);
         for tool in &tools {
             assert!(
                 !tool.description().is_empty(),
@@ -2135,7 +2158,7 @@ mod tests {
     #[test]
     fn default_tools_all_have_schemas() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(test_agent_env(), security);
         for tool in &tools {
             let schema = tool.parameters_schema();
             assert!(
@@ -2154,7 +2177,7 @@ mod tests {
     #[test]
     fn tool_spec_generation() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let tools = default_tools(test_agent_env(), security);
         for tool in &tools {
             let spec = tool.spec();
             assert_eq!(spec.name, tool.name());
@@ -2229,6 +2252,7 @@ mod tests {
 
         let tools = all_tools(
             Arc::new(Config::default()),
+            test_agent_env(),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -2268,6 +2292,7 @@ mod tests {
 
         let tools = all_tools(
             Arc::new(Config::default()),
+            test_agent_env(),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -2309,6 +2334,7 @@ mod tests {
 
         let tools = all_tools(
             Arc::new(cfg.clone()),
+            test_agent_env(),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -2349,6 +2375,7 @@ mod tests {
 
         let tools = all_tools(
             Arc::new(cfg.clone()),
+            test_agent_env(),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -2383,6 +2410,7 @@ mod tests {
 
         all_tools(
             Arc::new(cfg.clone()),
+            test_agent_env(),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",

@@ -3415,6 +3415,15 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub delegates: Vec<String>,
 
+    /// Per-agent custom environment variables (`[agents.<alias>.env]`).
+    /// Injected securely into execution contexts (like the ShellTool)
+    /// to support environment separation per agent runtime instance.
+    #[tab(EnvironmentVariables)]
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub env: HashMap<String, String>,
+
     // ── Resolved runtime tunables (populated by `resolved_agent_config`
     // from the runtime profile; not config-settable on the agent). ──
     #[serde(skip)]
@@ -3471,6 +3480,7 @@ impl Default for AliasedAgentConfig {
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
             identity: IdentityConfig::default(),
+            env: HashMap::new(),
         }
     }
 }
