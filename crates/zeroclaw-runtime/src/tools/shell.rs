@@ -856,7 +856,7 @@ mod tests {
             shell_max_memory_mb: 0,
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime());
+        let tool = ShellTool::new(test_agent_env(), security, test_runtime());
         let result = tool
             .execute(json!({"command": "echo memory-limit-disabled"}))
             .await
@@ -1453,8 +1453,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_drains_large_stdout_while_child_runs() {
-        let tool =
-            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let tool = ShellTool::new(
+            test_agent_env(),
+            unrestricted_shell_test_security(),
+            test_runtime(),
+        )
+        .with_timeout_secs(2);
         let result = tool
             .execute(json!({
                 "command": "awk 'BEGIN { for (i = 0; i < 200000; i++) printf \"x\" }'"
@@ -1477,8 +1481,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_marks_stdout_truncated_after_limit() {
-        let tool =
-            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let tool = ShellTool::new(
+            test_agent_env(),
+            unrestricted_shell_test_security(),
+            test_runtime(),
+        )
+        .with_timeout_secs(2);
         let result = tool
             .execute(json!({
                 "command": "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }'"
@@ -1500,8 +1508,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_marks_stderr_truncated_after_limit() {
-        let tool =
-            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let tool = ShellTool::new(
+            test_agent_env(),
+            unrestricted_shell_test_security(),
+            test_runtime(),
+        )
+        .with_timeout_secs(2);
         let result = tool
             .execute(json!({
                 "command": "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }' 1>&2"
@@ -1527,8 +1539,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_keeps_output_when_grandchild_holds_pipe_open() {
-        let tool =
-            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
+        let tool = ShellTool::new(
+            test_agent_env(),
+            unrestricted_shell_test_security(),
+            test_runtime(),
+        )
+        .with_timeout_secs(2);
         let result = tool
             .execute(json!({"command": "printf done; (sleep 1) &"}))
             .await

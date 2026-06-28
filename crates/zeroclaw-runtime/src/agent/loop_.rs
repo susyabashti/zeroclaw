@@ -13491,6 +13491,13 @@ Let me check the result."#;
         tools.iter().map(|t| t.name()).collect()
     }
 
+    fn test_agent_env() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            ("ZEROCLAW_AGENT_ID".to_string(), "test-agent".to_string()),
+            ("CUSTOM_ENV_VAR".to_string(), "test-value".to_string()),
+        ])
+    }
+
     #[test]
     fn apply_policy_tool_filter_no_gates_keeps_everything() {
         let mut tools = vec![
@@ -14272,6 +14279,7 @@ Let me check the result."#;
 
         let mut registry = crate::tools::all_tools(
             Arc::new(config.clone()),
+            test_agent_env(),
             &security,
             &risk,
             "test",
@@ -14338,6 +14346,7 @@ Let me check the result."#;
 
         let mut registry = crate::tools::all_tools(
             Arc::new(config.clone()),
+            test_agent_env(),
             &security,
             &risk,
             "test",
