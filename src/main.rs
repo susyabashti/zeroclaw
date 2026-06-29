@@ -3187,7 +3187,7 @@ async fn main() -> Result<()> {
     // Docs-pipeline subcommands: stdout-only, no config load, no logging init.
     match &cli.command {
         Commands::MarkdownHelp => {
-            print_markdown_help();
+            clap_markdown::print_help_markdown::<Cli>();
             return Ok(());
         }
         Commands::MarkdownSchema => {
@@ -3940,6 +3940,14 @@ async fn main() -> Result<()> {
                     (None, None)
                 };
 
+                // EPIC A1 + SOP cron: drive periodic maintenance and cron
+                // triggers against the shared engine for this daemon iteration.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    current_config.sop.maintenance_interval_secs,
+                );
+
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
@@ -4061,7 +4069,11 @@ async fn main() -> Result<()> {
                     registry,
                     ephemeral,
                 ))
-                .await?;
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                let exit = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
@@ -4670,10 +4682,20 @@ async fn main() -> Result<()> {
                 } else {
                     (None, None)
                 };
-                Box::pin(channels::start_channels(
+                // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    config.sop.maintenance_interval_secs,
+                );
+                let result = Box::pin(channels::start_channels(
                     config, None, cancel, sop_engine, sop_audit,
                 ))
-                .await
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                result
             }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
@@ -6255,117 +6277,6 @@ fi"#
     Ok(())
 }
 
-fn print_markdown_help() {
-    print!(
-        "{}",
-        escape_mdbook_placeholder_tags(&clap_markdown::help_markdown::<Cli>())
-    );
-}
-
-#[must_use]
-fn escape_mdbook_placeholder_tags(markdown: &str) -> String {
-    let mut escaped = String::with_capacity(markdown.len());
-    let mut in_fence = false;
-
-    for line in markdown.split_inclusive('\n') {
-        let (body, newline) = line
-            .strip_suffix('\n')
-            .map_or((line, ""), |body| (body, "\n"));
-        let starts_fence = is_markdown_fence_line(body);
-
-        if in_fence {
-            escaped.push_str(body);
-            escaped.push_str(newline);
-            if starts_fence {
-                in_fence = false;
-            }
-            continue;
-        }
-
-        if starts_fence {
-            in_fence = true;
-            escaped.push_str(body);
-        } else {
-            escaped.push_str(&escape_mdbook_placeholder_tags_in_line(body));
-        }
-        escaped.push_str(newline);
-    }
-
-    escaped
-}
-
-#[must_use]
-fn escape_mdbook_placeholder_tags_in_line(line: &str) -> String {
-    let mut escaped = String::with_capacity(line.len());
-    let mut index = 0;
-    let mut in_code_span = false;
-
-    while index < line.len() {
-        let Some(ch) = line[index..].chars().next() else {
-            break;
-        };
-
-        if ch == '`' {
-            in_code_span = !in_code_span;
-            escaped.push(ch);
-            index += ch.len_utf8();
-            continue;
-        }
-
-        if !in_code_span
-            && ch == '<'
-            && let Some(end_offset) = line[index + 1..].find('>')
-        {
-            let name_start = index + 1;
-            let name_end = name_start + end_offset;
-            let name = &line[name_start..name_end];
-
-            if is_cli_placeholder_name(name) {
-                escaped.push('`');
-                escaped.push_str(&line[index..=name_end]);
-                escaped.push('`');
-                index = name_end + 1;
-                continue;
-            }
-        }
-
-        escaped.push(ch);
-        index += ch.len_utf8();
-    }
-
-    escaped
-}
-
-#[must_use]
-fn is_markdown_fence_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
-}
-
-#[must_use]
-fn is_cli_placeholder_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    first.is_ascii_alphabetic()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-        && !is_common_html_tag(name)
-}
-
-#[must_use]
-fn is_common_html_tag(name: &str) -> bool {
-    const COMMON_HTML_TAGS: &[&str] = &[
-        "a", "abbr", "br", "code", "details", "div", "em", "img", "kbd", "li", "ol", "p", "samp",
-        "span", "strong", "summary", "table", "tbody", "td", "th", "thead", "tr", "ul", "var",
-    ];
-
-    let normalized = name.to_ascii_lowercase();
-    COMMON_HTML_TAGS.contains(&normalized.as_str())
-}
-
 // ─── Gateway helper functions ───────────────────────────────────────────────
 
 /// Resolve gateway host and port from CLI args or config.
@@ -7260,6 +7171,134 @@ fn gate_security_posture(
     Ok(Some(handle))
 }
 
+/// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
+/// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
+/// prunes terminal runs past the retention policy, and dispatches cached cron
+/// SOP triggers. Returns `None` (no task) when the tick is disabled
+/// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
+/// returned handle and aborts it when the foreground daemon/channel run exits.
+/// The tick itself self-approves nothing - timeout handling follows
+/// `approval_timeout_action` (default `escalate`, fail-closed).
+#[cfg(feature = "agent-runtime")]
+fn spawn_sop_maintenance(
+    sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    interval_secs: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if interval_secs == 0 {
+        return None;
+    }
+    let engine = sop_engine.cloned()?;
+    let audit = sop_audit.cloned();
+    let cron_cache = audit
+        .as_ref()
+        .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
+    Some(::zeroclaw_spawn::spawn!(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_cron_check = chrono::Utc::now();
+        loop {
+            ticker.tick().await;
+            let Some(report) = run_sop_maintenance_tick(
+                &engine,
+                audit.as_ref(),
+                cron_cache.as_ref(),
+                &mut last_cron_check,
+            )
+            .await
+            else {
+                continue;
+            };
+            if !report.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "timed_out": report.maintenance.timed_out,
+                            "reaped_claims": report.maintenance.reaped_claims,
+                            "pruned_runs": report.maintenance.pruned_runs,
+                            "cron_started": report.cron_started,
+                            "cron_skipped": report.cron_skipped,
+                            "cron_no_match": report.cron_no_match,
+                        })),
+                    "SOP maintenance tick"
+                );
+            }
+        }
+    }))
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Default)]
+struct SopMaintenanceTickReport {
+    maintenance: zeroclaw_runtime::sop::MaintenanceSummary,
+    cron_started: usize,
+    cron_skipped: usize,
+    cron_no_match: usize,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenanceTickReport {
+    fn is_empty(&self) -> bool {
+        self.maintenance.is_empty()
+            && self.cron_started == 0
+            && self.cron_skipped == 0
+            && self.cron_no_match == 0
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_sop_maintenance_tick(
+    engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+    audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
+    last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+) -> Option<SopMaintenanceTickReport> {
+    let maintenance = match engine.lock() {
+        Ok(mut e) => e.run_maintenance_tick(),
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP maintenance tick: engine lock poisoned; skipping this pass"
+            );
+            return None;
+        }
+    };
+
+    let mut report = SopMaintenanceTickReport {
+        maintenance,
+        ..SopMaintenanceTickReport::default()
+    };
+
+    if let (Some(audit), Some(cache)) = (audit, cron_cache) {
+        let results = zeroclaw_runtime::sop::dispatch::check_sop_cron_triggers(
+            engine,
+            audit,
+            cache,
+            last_cron_check,
+        )
+        .await;
+        for result in &results {
+            match result {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                    report.cron_started += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. } => {
+                    report.cron_skipped += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::NoMatch => {
+                    report.cron_no_match += 1;
+                }
+            }
+        }
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    }
+
+    Some(report)
+}
+
 #[cfg(feature = "gateway")]
 async fn run_gateway_if_enabled(
     host: &str,
@@ -7633,41 +7672,6 @@ mod tests {
         assert!(
             !script.contains("_zeroclaw_clap_orig() { _zeroclaw \"$@\"; }"),
             "bash completion must not define _zeroclaw_clap_orig as a simple forwarder to _zeroclaw"
-        );
-    }
-
-    #[test]
-    fn markdown_help_escapes_plain_placeholders_for_mdbook() {
-        assert_eq!(
-            escape_mdbook_placeholder_tags("Send a note to <to> with <MESSAGE>.\n"),
-            "Send a note to `<to>` with `<MESSAGE>`.\n"
-        );
-    }
-
-    #[test]
-    fn markdown_help_preserves_existing_code_spans() {
-        let markdown = "Use `<to>` or `zeroclaw send <to>` from a shell.\n";
-
-        assert_eq!(escape_mdbook_placeholder_tags(markdown), markdown);
-    }
-
-    #[test]
-    fn markdown_help_preserves_fenced_code_blocks() {
-        let markdown = "Example:\n```bash\nzeroclaw send <to>\n```\nThen pass <message>.\n";
-
-        assert_eq!(
-            escape_mdbook_placeholder_tags(markdown),
-            "Example:\n```bash\nzeroclaw send <to>\n```\nThen pass `<message>`.\n"
-        );
-    }
-
-    #[test]
-    fn markdown_help_does_not_escape_common_html_or_autolinks() {
-        let markdown = "Use <br> for HTML, see <https://example.com>, then pass <arg-name>.\n";
-
-        assert_eq!(
-            escape_mdbook_placeholder_tags(markdown),
-            "Use <br> for HTML, see <https://example.com>, then pass `<arg-name>`.\n"
         );
     }
 
@@ -8452,6 +8456,63 @@ mod tests {
             !created,
             "auto-materialization must stay scoped to typed provider aliases"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_memory::traits::Memory;
+        use zeroclaw_runtime::sop::{
+            Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "cron-sop".into(),
+            description: "cron regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Supervised,
+            priority: SopPriority::Normal,
+            triggers: vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+        }]);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
+        let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report =
+            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
+                .await
+                .expect("maintenance tick should complete");
+
+        assert_eq!(report.cron_started, 1);
+        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
     }
 
     #[test]
