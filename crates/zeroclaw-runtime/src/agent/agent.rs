@@ -1419,7 +1419,6 @@ impl Agent {
 
         let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
-            agent_cfg.env.clone(),
             &security,
             risk_profile,
             agent_alias,

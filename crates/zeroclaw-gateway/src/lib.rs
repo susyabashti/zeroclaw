@@ -988,15 +988,8 @@ pub async fn run_gateway(
 
     let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
-            let agent_env = config
-                .agents
-                .get(agent_alias)
-                .map(|a| a.env.clone())
-                .unwrap_or_default();
-
             let all_tools_result = tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
-                agent_env,
                 &security,
                 &risk_profile,
                 agent_alias,
@@ -1113,11 +1106,6 @@ pub async fn run_gateway(
             );
             continue;
         };
-        let agent_env = config
-            .agents
-            .get(&alias)
-            .map(|a| a.env.clone())
-            .unwrap_or_default();
 
         let risk_profile = risk_profile.clone();
         let security = match SecurityPolicy::for_agent(&config, &alias) {
@@ -1137,7 +1125,6 @@ pub async fn run_gateway(
         };
         let agent_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
-            agent_env,
             &security,
             &risk_profile,
             &alias,

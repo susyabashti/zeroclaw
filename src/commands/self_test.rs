@@ -201,13 +201,7 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
             Err(e) => return CheckResult::fail("tools", format!("agent {alias}: {e}")),
         };
 
-        let agent_env = config
-            .agents
-            .get(*alias)
-            .map(|a| a.env.clone())
-            .unwrap_or_default();
-
-        let tools = crate::tools::default_tools(agent_env, security);
+        let tools = crate::tools::default_tools(security);
         if tools.is_empty() {
             return CheckResult::fail("tools", format!("agent {alias}: no tools registered"));
         }

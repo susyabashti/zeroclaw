@@ -1277,7 +1277,6 @@ pub async fn run(
 
         let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
-            agent.env.clone(),
             &security,
             &risk_profile,
             agent_alias,
@@ -2936,7 +2935,6 @@ pub async fn process_message(
 
         let all_tools_result_pm = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
-            agent.env.clone(),
             &security,
             &risk_profile,
             agent_alias,
@@ -7091,7 +7089,7 @@ mod tests {
         let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
             Arc::new(crate::platform::NativeRuntime::new());
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
-            crate::tools::shell::ShellTool::new(Default::default(), security, runtime),
+            crate::tools::shell::ShellTool::new(security, runtime),
         )];
 
         let mut history = vec![
@@ -11403,7 +11401,7 @@ This is an example, not an invocation."#;
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             std::path::Path::new("/tmp"),
         ));
-        let tools = tools::default_tools(Default::default(), security);
+        let tools = tools::default_tools(security);
         let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
@@ -11428,7 +11426,7 @@ This is an example, not an invocation."#;
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             std::path::Path::new("/tmp"),
         ));
-        let tools = tools::default_tools(Default::default(), security);
+        let tools = tools::default_tools(security);
         let formatted = tools_to_openai_format(&tools);
 
         assert!(!formatted.is_empty());
@@ -13872,13 +13870,6 @@ Let me check the result."#;
         tools.iter().map(|t| t.name()).collect()
     }
 
-    fn test_agent_env() -> std::collections::HashMap<String, String> {
-        std::collections::HashMap::from([
-            ("ZEROCLAW_AGENT_ID".to_string(), "test-agent".to_string()),
-            ("CUSTOM_ENV_VAR".to_string(), "test-value".to_string()),
-        ])
-    }
-
     #[test]
     fn apply_policy_tool_filter_no_gates_keeps_everything() {
         let mut tools = vec![
@@ -14407,7 +14398,6 @@ Let me check the result."#;
 
         let mut registry = crate::tools::all_tools(
             Arc::new(config.clone()),
-            Default::default(),
             &security,
             &risk,
             "test",
@@ -14468,7 +14458,6 @@ Let me check the result."#;
         // Denylist variant: an exclusion drops only the named tool.
         let mut registry2 = crate::tools::all_tools(
             Arc::new(config.clone()),
-            Default::default(),
             &security,
             &risk,
             "test",
@@ -14742,7 +14731,6 @@ Let me check the result."#;
 
         let mut registry = crate::tools::all_tools(
             Arc::new(config.clone()),
-            test_agent_env(),
             &security,
             &risk,
             "test",
@@ -14809,7 +14797,6 @@ Let me check the result."#;
 
         let mut registry = crate::tools::all_tools(
             Arc::new(config.clone()),
-            test_agent_env(),
             &security,
             &risk,
             "test",

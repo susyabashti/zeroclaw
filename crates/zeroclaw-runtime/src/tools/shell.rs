@@ -84,7 +84,6 @@ const SAFE_ENV_VARS: &[&str] = &[
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
-    agent_env: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
@@ -102,41 +101,42 @@ pub struct ShellTool {
     /// than refusing (like `file_write`) it attaches a loud warning to every
     /// executed command's result. See issue #4627.
     persistent_writes: bool,
+    // Runtime context and secrets are forwarded from the agent config to the shell tool.
+    runtime_context: HashMap<String, String>,
+    // Runtime secrets are forwarded from the agent config to the shell tool.
+    runtime_secrets: HashMap<String, String>,
 }
 
 impl ShellTool {
-    pub fn new(
-        agent_env: HashMap<String, String>,
-        security: Arc<SecurityPolicy>,
-        runtime: Arc<dyn RuntimeAdapter>,
-    ) -> Self {
+    pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
         let timeout_secs = security.shell_timeout_secs;
         Self {
-            agent_env: sanitize_agent_env(agent_env),
             security,
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
             timeout_secs,
             tui_env: None,
             persistent_writes: true,
+            runtime_context: HashMap::new(),
+            runtime_secrets: HashMap::new(),
         }
     }
 
     pub fn new_with_sandbox(
-        agent_env: HashMap<String, String>,
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
         sandbox: Arc<dyn Sandbox>,
     ) -> Self {
         let timeout_secs = security.shell_timeout_secs;
         Self {
-            agent_env: sanitize_agent_env(agent_env),
             security,
             runtime,
             sandbox,
             timeout_secs,
             tui_env: None,
             persistent_writes: true,
+            runtime_context: HashMap::new(),
+            runtime_secrets: HashMap::new(),
         }
     }
 
@@ -163,6 +163,16 @@ impl ShellTool {
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
         self.tui_env = env;
+        self
+    }
+
+    pub fn with_runtime_context(mut self, context: HashMap<String, String>) -> Self {
+        self.runtime_context = context;
+        self
+    }
+
+    pub fn with_runtime_secrets(mut self, secrets: HashMap<String, String>) -> Self {
+        self.runtime_secrets = secrets;
         self
     }
 }
@@ -252,30 +262,6 @@ fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
         }
     }
     out
-}
-
-fn sanitize_agent_env(
-    raw_env: std::collections::HashMap<String, String>,
-) -> std::collections::HashMap<String, String> {
-    let mut clean_env = std::collections::HashMap::new();
-
-    for (key, val) in raw_env {
-        let trimmed_key = key.trim();
-
-        // 1. Enforce strict POSIX variable name rules (No spaces, no special symbols)
-        if trimmed_key.is_empty() || !is_valid_env_var_name(trimmed_key) {
-            continue;
-        }
-
-        // 2. Prevent shell injection vectors in the value (e.g., blocking null bytes)
-        if val.contains('\0') {
-            continue;
-        }
-
-        clean_env.insert(trimmed_key.to_string(), val);
-    }
-
-    clean_env
 }
 
 /// Name of the environment variable that carries the in-flight session key
@@ -382,13 +368,32 @@ impl Tool for ShellTool {
 
         cmd.env_clear();
 
-        for (key, val) in &self.agent_env {
-            cmd.env(key, val);
+        // 1. Collect the allowed keys into a HashSet for O(1) lookups
+        use std::collections::HashSet;
+        let allowed_vars: HashSet<String> = collect_allowed_shell_env_vars(&self.security)
+            .into_iter()
+            .collect();
+
+        // 2. Pull from the host system's environment, still respecting the allowed list
+        for var in &allowed_vars {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
         }
 
-        for var in collect_allowed_shell_env_vars(&self.security) {
-            if let Ok(val) = std::env::var(&var) {
-                cmd.env(&var, val);
+        // 3. Only inject runtime_context if the key is in the allowed list
+        // (Note: runtime_context takes precedence over system env vars, so they're injected first)
+        for (key, val) in &self.runtime_context {
+            if allowed_vars.contains(key) {
+                cmd.env(key, val);
+            }
+        }
+
+        // 4. Only inject runtime_secrets if the key is in the allowed list
+        // (Note: runtime_secrets take precedence over runtime_context, so they're injected last)
+        for (key, val) in &self.runtime_secrets {
+            if allowed_vars.contains(key) {
+                cmd.env(key, val);
             }
         }
 
@@ -686,11 +691,12 @@ mod tests {
         Arc::new(NativeRuntime::new())
     }
 
-    fn test_agent_env() -> std::collections::HashMap<String, String> {
-        std::collections::HashMap::from([
-            ("ZEROCLAW_AGENT_ID".to_string(), "test-agent".to_string()),
-            ("CUSTOM_ENV_VAR".to_string(), "test-value".to_string()),
-        ])
+    fn test_runtime_context() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    fn test_runtime_secrets() -> HashMap<String, String> {
+        HashMap::new()
     }
 
     #[cfg(windows)]
@@ -733,13 +739,10 @@ mod tests {
     /// Returns the fully-wrapped shell tool as it is composed in production:
     /// RateLimited(PathGuarded(ShellTool)).  Tests that verify path-blocking or
     /// rate-limiting behaviour must use this helper so they exercise the wrappers.
-    fn wrapped_shell(
-        agent_env: HashMap<String, String>,
-        security: Arc<SecurityPolicy>,
-    ) -> RateLimitedTool<PathGuardedTool<ShellTool>> {
+    fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<PathGuardedTool<ShellTool>> {
         RateLimitedTool::new(
             PathGuardedTool::new(
-                ShellTool::new(agent_env, security.clone(), test_runtime()),
+                ShellTool::new(security.clone(), test_runtime()),
                 security.clone(),
             ),
             security,
@@ -748,31 +751,19 @@ mod tests {
 
     #[test]
     fn shell_tool_name() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         assert_eq!(tool.name(), "shell");
     }
 
     #[test]
     fn shell_tool_description() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn shell_tool_schema_has_command() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
         assert!(
@@ -792,7 +783,7 @@ mod tests {
             allowed_commands: vec![stdin_reader_command().into()],
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(test_agent_env(), security, test_runtime());
+        let tool = ShellTool::new(security, test_runtime());
         let fut = tool.execute(json!({"command": stdin_reader_command()}));
         let res = tokio::time::timeout(std::time::Duration::from_secs(10), fut).await;
         assert!(
@@ -808,11 +799,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_executes_allowed_command() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
@@ -824,11 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_disallowed_command() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
             .execute(json!({"command": "rm -rf /"}))
             .await
@@ -840,11 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::ReadOnly),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
         let result = tool
             .execute(json!({"command": "ls"}))
             .await
@@ -861,11 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_missing_command_param() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("command"));
@@ -873,22 +848,14 @@ mod tests {
 
     #[tokio::test]
     async fn shell_wrong_type_param() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool.execute(json!({"command": 123})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn shell_captures_exit_code() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
             .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
             .await
@@ -903,12 +870,8 @@ mod tests {
     /// visible. The original command output must be preserved below the banner.
     #[tokio::test]
     async fn shell_warns_on_ephemeral_workspace() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        )
-        .with_persistent_writes(false);
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_persistent_writes(false);
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
@@ -936,12 +899,8 @@ mod tests {
     /// never lost on the failure path.
     #[tokio::test]
     async fn shell_warns_on_ephemeral_workspace_failure_path() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        )
-        .with_persistent_writes(false);
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_persistent_writes(false);
         let result = tool
             .execute(json!({"command": "ls /nonexistent_dir_xyz_4627"}))
             .await
@@ -964,12 +923,8 @@ mod tests {
     /// regardless of which the model reads. Exercises the dual-field branch.
     #[tokio::test]
     async fn shell_warns_on_ephemeral_success_with_stderr() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Full),
-            test_runtime(),
-        )
-        .with_persistent_writes(false);
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime())
+            .with_persistent_writes(false);
         let result = tool
             .execute(json!({"command": success_with_stderr_command()}))
             .await
@@ -994,11 +949,7 @@ mod tests {
     /// On a persistent runtime (the default) no warning is attached.
     #[tokio::test]
     async fn shell_no_warning_when_persistent() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
@@ -1013,7 +964,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_absolute_path_argument() {
-        let tool = wrapped_shell(test_agent_env(), test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
         let result = tool
             .execute(json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
@@ -1030,7 +981,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_option_assignment_path_argument() {
-        let tool = wrapped_shell(test_agent_env(), test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
         let result = tool
             .execute(json!({"command": format!("grep --file={} root ./src", absolute_path_outside_workspace())}))
             .await
@@ -1047,7 +998,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_short_option_attached_path_argument() {
-        let tool = wrapped_shell(test_agent_env(), test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
         let result = tool
             .execute(json!({"command": format!("grep -f{} root ./src", absolute_path_outside_workspace())}))
             .await
@@ -1064,7 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_tilde_user_path_argument() {
-        let tool = wrapped_shell(test_agent_env(), test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
         let result = tool
             .execute(json!({"command": "cat ~root/.ssh/id_rsa"}))
             .await
@@ -1082,11 +1033,7 @@ mod tests {
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn shell_blocks_input_redirection_path_bypass() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
             .execute(json!({"command": "cat </etc/passwd"}))
             .await
@@ -1206,11 +1153,7 @@ mod tests {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security_with_env_cmd(),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
         let result = tool
             .execute(json!({"command": env_print_command()}))
             .await
@@ -1228,11 +1171,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_preserves_path_and_home_for_env_command() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security_with_env_cmd(),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
 
         let result = tool
             .execute(json!({"command": env_print_command()}))
@@ -1253,11 +1192,7 @@ mod tests {
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn shell_blocks_plain_variable_expansion() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security_with_env_cmd(),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
         let result = tool
             .execute(json!({"command": "echo $HOME"}))
             .await
@@ -1276,7 +1211,6 @@ mod tests {
     async fn shell_allows_configured_env_passthrough() {
         let _guard = EnvGuard::set("ZEROCLAW_TEST_PASSTHROUGH", "db://unit-test");
         let tool = ShellTool::new(
-            test_agent_env(),
             test_security_with_env_passthrough(&["ZEROCLAW_TEST_PASSTHROUGH"]),
             test_runtime(),
         );
@@ -1311,6 +1245,86 @@ mod tests {
         assert!(!vars.contains(&"1NOPE".to_string()));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_allows_configured_runtime_context_and_secrets() {
+        // Prepare runtime variables
+        let mut context = HashMap::new();
+        context.insert("ALLOWED_CONTEXT".to_string(), "ctx_val".to_string());
+        context.insert("BLOCKED_CONTEXT".to_string(), "hidden_ctx".to_string());
+
+        let mut secrets = HashMap::new();
+        secrets.insert("ALLOWED_SECRET".to_string(), "secret_val".to_string());
+        secrets.insert("BLOCKED_SECRET".to_string(), "hidden_secret".to_string());
+
+        // We ONLY allow ALLOWED_CONTEXT and ALLOWED_SECRET in the passthrough configuration
+        let tool = ShellTool::new(
+            test_security_with_env_passthrough(&["ALLOWED_CONTEXT", "ALLOWED_SECRET"]),
+            test_runtime(),
+        )
+        .with_runtime_context(context)
+        .with_runtime_secrets(secrets);
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+
+        // 1. Allowed vars should be explicitly visible
+        assert!(env_output_contains_assignment(
+            &result.output,
+            "ALLOWED_CONTEXT",
+            "ctx_val"
+        ));
+        assert!(env_output_contains_assignment(
+            &result.output,
+            "ALLOWED_SECRET",
+            "secret_val"
+        ));
+
+        // 2. Blocked vars must NOT be present in the tool's environment output
+        // (Assuming you have a helper or can just assert !contains)
+        assert!(!result.output.contains("BLOCKED_CONTEXT"));
+        assert!(!result.output.contains("BLOCKED_SECRET"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_runtime_vars_override_system_env_with_correct_precedence() {
+        // Lowest Priority: Host System Environment
+        let _guard = EnvGuard::set("OVERRIDE_ME", "system_level_value");
+
+        // Medium Priority: Runtime Context
+        let mut context = HashMap::new();
+        context.insert("OVERRIDE_ME".to_string(), "context_level_value".to_string());
+
+        // Highest Priority: Runtime Secrets
+        let mut secrets = HashMap::new();
+        secrets.insert("OVERRIDE_ME".to_string(), "secret_wins_value".to_string());
+
+        // Whitelist the key so it's allowed through all loops
+        let tool = ShellTool::new(
+            test_security_with_env_passthrough(&["OVERRIDE_ME"]),
+            test_runtime(),
+        )
+        .with_runtime_context(context)
+        .with_runtime_secrets(secrets);
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+
+        // Assert that the highest priority (secret) successfully completely overwrote the others
+        assert!(env_output_contains_assignment(
+            &result.output,
+            "OVERRIDE_ME",
+            "secret_wins_value"
+        ));
+    }
+
     #[tokio::test]
     async fn shell_requires_approval_for_medium_risk_command() {
         let security = Arc::new(SecurityPolicy {
@@ -1320,7 +1334,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
 
-        let tool = ShellTool::new(test_agent_env(), security.clone(), test_runtime());
+        let tool = ShellTool::new(security.clone(), test_runtime());
         let denied = tool
             .execute(json!({"command": medium_risk_write_command()}))
             .await
@@ -1351,12 +1365,8 @@ mod tests {
 
     #[test]
     fn shell_timeout_can_be_overridden() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-        )
-        .with_timeout_secs(120);
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_timeout_secs(120);
         assert_eq!(tool.timeout_secs, 120);
     }
 
@@ -1371,12 +1381,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_drains_large_stdout_while_child_runs() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            unrestricted_shell_test_security(),
-            test_runtime(),
-        )
-        .with_timeout_secs(2);
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
         let result = tool
             .execute(json!({
                 "command": "awk 'BEGIN { for (i = 0; i < 200000; i++) printf \"x\" }'"
@@ -1399,12 +1405,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_marks_stdout_truncated_after_limit() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            unrestricted_shell_test_security(),
-            test_runtime(),
-        )
-        .with_timeout_secs(2);
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
         let result = tool
             .execute(json!({
                 "command": "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }'"
@@ -1426,12 +1428,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_marks_stderr_truncated_after_limit() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            unrestricted_shell_test_security(),
-            test_runtime(),
-        )
-        .with_timeout_secs(2);
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
         let result = tool
             .execute(json!({
                 "command": "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }' 1>&2"
@@ -1457,12 +1455,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_keeps_output_when_grandchild_holds_pipe_open() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            unrestricted_shell_test_security(),
-            test_runtime(),
-        )
-        .with_timeout_secs(2);
+        let tool =
+            ShellTool::new(unrestricted_shell_test_security(), test_runtime()).with_timeout_secs(2);
         let result = tool
             .execute(json!({"command": "printf done; (sleep 1) &"}))
             .await
@@ -1569,7 +1563,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = wrapped_shell(test_agent_env(), security);
+        let tool = wrapped_shell(security);
         let result = tool
             .execute(json!({"command": "echo test"}))
             .await
@@ -1585,7 +1579,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(test_agent_env(), security, test_runtime());
+        let tool = ShellTool::new(security, test_runtime());
         let result = tool
             .execute(json!({"command": "nonexistent_binary_xyz_12345"}))
             .await
@@ -1595,11 +1589,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_captures_stderr_output() {
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security(AutonomyLevel::Full),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
         let result = tool
             .execute(json!({"command": "echo error_msg >&2"}))
             .await
@@ -1615,7 +1605,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = wrapped_shell(test_agent_env(), security);
+        let tool = wrapped_shell(security);
 
         let r1 = tool
             .execute(json!({"command": "echo first"}))
@@ -1642,7 +1632,6 @@ mod tests {
 
         let sandbox: Arc<dyn Sandbox> = Arc::new(NoopSandbox);
         let tool = ShellTool::new_with_sandbox(
-            test_agent_env(),
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             sandbox,
@@ -1678,7 +1667,6 @@ mod tests {
 
         let sandbox: Arc<dyn Sandbox> = Arc::new(NoopSandbox);
         let tool = ShellTool::new_with_sandbox(
-            test_agent_env(),
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             sandbox,
@@ -1697,16 +1685,12 @@ mod tests {
     async fn shell_tui_env_is_passed_to_subprocess() {
         // A var that is NOT in SAFE_ENV_VARS and NOT in passthrough —
         // it should only appear if tui_env injects it.
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security_with_env_cmd(),
-            test_runtime(),
-        )
-        .with_tui_env(Some({
-            let mut m = std::collections::HashMap::new();
-            m.insert("ZC_TUI_TEST_VAR".to_string(), "tui_injected".to_string());
-            m
-        }));
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("ZC_TUI_TEST_VAR".to_string(), "tui_injected".to_string());
+                m
+            }));
 
         let result = tool
             .execute(json!({"command": env_print_command()}))
@@ -1724,11 +1708,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_without_tui_env_does_not_inject_extra_vars() {
         // Without tui_env, a non-safe var must NOT appear.
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security_with_env_cmd(),
-            test_runtime(),
-        );
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
 
         let result = tool
             .execute(json!({"command": env_print_command()}))
@@ -1749,16 +1729,12 @@ mod tests {
         let home_key = home_env_key();
         let _guard = EnvGuard::set(home_key, "daemon-home");
 
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security_with_env_cmd(),
-            test_runtime(),
-        )
-        .with_tui_env(Some({
-            let mut m = std::collections::HashMap::new();
-            m.insert(home_key.to_string(), "tui-home".to_string());
-            m
-        }));
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert(home_key.to_string(), "tui-home".to_string());
+                m
+            }));
 
         let result = tool
             .execute(json!({"command": env_print_command()}))
@@ -1786,12 +1762,7 @@ mod tests {
     async fn shell_tui_env_none_behaves_like_existing() {
         // with_tui_env(None) must be identical to no tui_env at all —
         // only SAFE_ENV_VARS + passthrough reach the subprocess.
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security_with_env_cmd(),
-            test_runtime(),
-        )
-        .with_tui_env(None);
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(None);
 
         let result = tool
             .execute(json!({"command": env_print_command()}))
@@ -1810,16 +1781,12 @@ mod tests {
         // The whole point: secrets from the TUI env (e.g. SSH_AUTH_SOCK)
         // DO reach the subprocess via tui_env even though they are not
         // in SAFE_ENV_VARS.
-        let tool = ShellTool::new(
-            test_agent_env(),
-            test_security_with_env_cmd(),
-            test_runtime(),
-        )
-        .with_tui_env(Some({
-            let mut m = std::collections::HashMap::new();
-            m.insert("SSH_AUTH_SOCK".to_string(), "/tmp/fake.sock".to_string());
-            m
-        }));
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("SSH_AUTH_SOCK".to_string(), "/tmp/fake.sock".to_string());
+                m
+            }));
 
         // Confirm SSH_AUTH_SOCK is not in the safe list (would be a bug if it were)
         assert!(

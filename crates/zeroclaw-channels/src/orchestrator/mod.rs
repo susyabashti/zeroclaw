@@ -9229,7 +9229,6 @@ pub async fn start_channels(
 
         let all_tools_result_ch = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
-            agent.env.clone(),
             &security,
             &risk_profile,
             agent_alias,
