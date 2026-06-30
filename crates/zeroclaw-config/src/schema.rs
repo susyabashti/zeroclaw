@@ -3604,6 +3604,7 @@ pub struct AliasedAgentConfig {
     /// Per-agent custom environment variables stored as secrets at rest (`[agents.<alias>.runtime_secrets]`).
     /// Injected securely into execution contexts (like the ShellTool)
     /// to support environment separation per agent runtime instance.
+    /// Takes precedence over `runtime_context`.
     #[tab(RuntimeSecrets)]
     #[serde(default)]
     #[secret]
