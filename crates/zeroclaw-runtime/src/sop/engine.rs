@@ -15,13 +15,14 @@ use super::store::{
     InMemoryRunStore, PersistedRun, RetentionPolicy, SopEventRecord, SopRunStore, StoreError,
 };
 use super::types::{
-    DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
-    SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
-    SopTrigger, SopTriggerSource,
+    DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopEvent,
+    SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind,
+    SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
 };
 use crate::calendar::{CALENDAR_NO_SHOW_TOPIC, CalendarNoShowEvent};
+use crate::security::{ContentSafety, new_marker_id};
 use serde_json::Value;
-use zeroclaw_config::schema::SopConfig;
+use zeroclaw_config::schema::{ApprovalMode, SopConfig};
 
 /// Central SOP orchestrator: loads SOPs, matches triggers, manages run lifecycle.
 pub struct SopEngine {
@@ -180,6 +181,35 @@ impl SopEngine {
         }
     }
 
+    fn record_transition_event(
+        &self,
+        run_id: &str,
+        kind: &str,
+        reason: Option<String>,
+        payload: serde_json::Value,
+    ) {
+        let ev = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: kind.to_string(),
+            actor: None,
+            reason,
+            payload,
+        };
+        if let Err(e) = self.store.append_event(&ev) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"run_id": run_id, "kind": kind, "error": e.to_string()})
+                    ),
+                "SOP engine: failed to append transition event"
+            );
+        }
+    }
+
     /// Load/reload SOPs from the configured directory.
     pub fn reload(&mut self, workspace_dir: &Path) {
         self.sops = load_sops(
@@ -317,6 +347,7 @@ impl SopEngine {
             run_id: run_id.clone(),
             sop_name: sop_name.to_string(),
             trigger_event: event,
+            frame_marker_id: new_marker_id(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: u32::try_from(sop.steps.len()).unwrap_or(u32::MAX),
@@ -422,11 +453,21 @@ impl SopEngine {
         if result.status == SopStepStatus::Completed {
             let output = step_result_value(&result);
             if let Err(reason) = self.validate_step_output(&current_step, &output) {
-                recorded.status = SopStepStatus::Failed;
-                recorded.output = format!(
+                let full_reason = format!(
                     "Step {} output schema validation failed: {reason}",
                     current_step.number
                 );
+                self.record_transition_event(
+                    run_id,
+                    "step_schema_reject",
+                    Some(full_reason.clone()),
+                    ::serde_json::json!({
+                        "step": current_step.number,
+                        "phase": "output",
+                    }),
+                );
+                recorded.status = SopStepStatus::Failed;
+                recorded.output = full_reason;
             }
         }
 
@@ -503,6 +544,15 @@ impl SopEngine {
         reason: String,
     ) -> SopRunAction {
         let reason = format!("Step {step_number} {phase} schema validation failed: {reason}");
+        self.record_transition_event(
+            run_id,
+            "step_schema_reject",
+            Some(reason.clone()),
+            ::serde_json::json!({
+                "step": step_number,
+                "phase": phase,
+            }),
+        );
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -628,6 +678,15 @@ impl SopEngine {
                 if let Some(action) = self.visit_bound_failure(run_id, step_number)? {
                     return Ok(action);
                 }
+                self.record_transition_event(
+                    run_id,
+                    "step_promoted",
+                    None,
+                    ::serde_json::json!({
+                        "from_step": current_step_number,
+                        "to_step": step_number,
+                    }),
+                );
                 if deterministic {
                     let input = routed_input.unwrap_or_default();
                     self.dispatch_deterministic_step(run_id, sop, step_number, input)
@@ -639,6 +698,14 @@ impl SopEngine {
                 if let Some(action) = self.visit_bound_failure(run_id, current_step_number)? {
                     return Ok(action);
                 }
+                self.record_transition_event(
+                    run_id,
+                    "step_retry",
+                    None,
+                    ::serde_json::json!({
+                        "step": current_step_number,
+                    }),
+                );
                 if deterministic {
                     self.dispatch_deterministic_step(
                         run_id,
@@ -748,9 +815,15 @@ impl SopEngine {
                 .active_runs
                 .get(run_id)
                 .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
-            format_step_context(sop, run, &step)
+            format_step_context(sop, run, &step, &self.config)
         };
-        let action = resolve_step_action(sop, &step, run_id.to_string(), context);
+        let action = resolve_step_action(
+            sop,
+            &step,
+            run_id.to_string(),
+            context,
+            self.config.approval_mode,
+        );
         if matches!(action, SopRunAction::WaitApproval { .. })
             && let Some(run) = self.active_runs.get_mut(run_id)
         {
@@ -841,6 +914,15 @@ impl SopEngine {
                     "reason": reason,
                 })),
             "SOP run pending on step dependencies"
+        );
+        self.record_transition_event(
+            run_id,
+            "step_skipped",
+            Some(reason.clone()),
+            ::serde_json::json!({
+                "step": step_number,
+                "status": "pending",
+            }),
         );
         self.persist_active(run_id);
         SopRunAction::Pending {
@@ -1008,7 +1090,7 @@ impl SopEngine {
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
         run.status = SopRunStatus::Running;
         run.waiting_since = None;
-        let context = format_step_context(&sop, run, &step);
+        let context = format_step_context(&sop, run, &step, &self.config);
 
         self.persist_active(run_id);
         Ok(SopRunAction::ExecuteStep {
@@ -1086,6 +1168,7 @@ impl SopEngine {
             run_id: run_id.clone(),
             sop_name: sop_name.to_string(),
             trigger_event: event,
+            frame_marker_id: new_marker_id(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps,
@@ -1107,6 +1190,33 @@ impl SopEngine {
         );
 
         self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null)
+    }
+
+    /// Drive a just-started headless deterministic run to a terminal state.
+    ///
+    /// Channel-sourced dispatch (filesystem, MQTT, peripheral, cron) has no
+    /// agent loop to execute steps, so a deterministic run that returns
+    /// `DeterministicStep` would otherwise sit in `active_runs` as `Running`
+    /// forever, consuming its `max_concurrent` slot and blocking every later
+    /// event from the same SOP. Advancing each step here drains the chain to
+    /// `Completed`, which evicts the run via `finish_run` and frees the slot so
+    /// the next matching event can fire. A `CheckpointWait` is intentionally
+    /// left paused (an operator gate, not a stuck run).
+    pub fn drive_headless_deterministic(
+        &mut self,
+        run_id: &str,
+        first_action: SopRunAction,
+    ) -> Result<SopRunAction> {
+        let mut action = first_action;
+        loop {
+            match action {
+                SopRunAction::DeterministicStep { ref input, .. } => {
+                    let piped = input.clone();
+                    action = self.advance_deterministic_step(run_id, piped, None)?;
+                }
+                terminal => return Ok(terminal),
+            }
+        }
     }
 
     /// Advance a deterministic run with the output of the current step.
@@ -1195,16 +1305,26 @@ impl SopEngine {
         let mut last_status = SopStepStatus::Completed;
         if let Err(reason) = self.validate_step_output(&current_step, &step_output) {
             last_status = SopStepStatus::Failed;
+            let full_reason = format!(
+                "Step {} output schema validation failed: {reason}",
+                current_step.number
+            );
+            self.record_transition_event(
+                run_id,
+                "step_schema_reject",
+                Some(full_reason.clone()),
+                ::serde_json::json!({
+                    "step": current_step.number,
+                    "phase": "output",
+                }),
+            );
             if let Some(recorded) = self
                 .active_runs
                 .get_mut(run_id)
                 .and_then(|run| run.step_results.last_mut())
             {
                 recorded.status = SopStepStatus::Failed;
-                recorded.output = format!(
-                    "Step {} output schema validation failed: {reason}",
-                    current_step.number
-                );
+                recorded.output = full_reason;
             }
         } else if let Some(run) = self.active_runs.get_mut(run_id) {
             // Each deterministic step saves one LLM call only when the step
@@ -1644,7 +1764,7 @@ impl SopEngine {
     // ── EPIC C: out-of-band approval plane ──────────────────────────
 
     /// Read-only config access for the approval resolver.
-    pub(crate) fn config(&self) -> &SopConfig {
+    pub fn config(&self) -> &SopConfig {
         &self.config
     }
 
@@ -1785,6 +1905,30 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
         }
 
         (
+            SopTrigger::Filesystem {
+                path,
+                events,
+                condition,
+            },
+            SopTriggerSource::Filesystem,
+        ) => {
+            let path_match = event
+                .topic
+                .as_deref()
+                .is_some_and(|t| filesystem_path_matches(path, t));
+            if !path_match {
+                return false;
+            }
+            if !events.is_empty() && !filesystem_event_listed(events, event.payload.as_deref()) {
+                return false;
+            }
+            match condition {
+                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
+                None => true,
+            }
+        }
+
+        (
             SopTrigger::Calendar {
                 calendar_source,
                 calendar_ids,
@@ -1855,20 +1999,37 @@ fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
     pi == pat_parts.len() && ti == top_parts.len()
 }
 
+/// Glob match a filesystem trigger `pattern` against a normalized `path`,
+/// supporting `*` (single segment) and `**` (recursive) wildcards via the
+/// `glob` crate. A bare directory pattern also matches paths nested beneath it.
+fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
+    if let Ok(compiled) = glob::Pattern::new(pattern)
+        && compiled.matches(path)
+    {
+        return true;
+    }
+    let prefix = pattern.trim_end_matches('/');
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Whether the payload's `event` field names one of the trigger's listed kinds.
+fn filesystem_event_listed(events: &[FilesystemEventKind], payload: Option<&str>) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(kind) = value.get("event").and_then(|e| e.as_str()) else {
+        return false;
+    };
+    events.iter().any(|e| e.to_string() == kind)
+}
+
 // ── Execution mode resolution ───────────────────────────────────
 
-/// Determine the action for a step based on SOP execution mode.
-fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: String) -> SopRunAction {
-    // Steps with requires_confirmation always need approval
-    if step.requires_confirmation {
-        return SopRunAction::WaitApproval {
-            run_id,
-            step: step.clone(),
-            context,
-        };
-    }
-
-    let needs_approval = match sop.execution_mode {
+fn execution_mode_needs_approval(mode: SopExecutionMode, sop: &Sop, step: &SopStep) -> bool {
+    match mode {
         // Deterministic mode is handled via start_deterministic_run;
         // if we reach here via the standard path, treat as Auto.
         SopExecutionMode::Auto | SopExecutionMode::Deterministic => false,
@@ -1886,7 +2047,32 @@ fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: Strin
                 step.number == 1
             }
         },
-    };
+    }
+}
+
+/// Determine the action for a step based on the effective execution mode.
+fn resolve_step_action(
+    sop: &Sop,
+    step: &SopStep,
+    run_id: String,
+    context: String,
+    approval_mode: ApprovalMode,
+) -> SopRunAction {
+    // Steps with requires_confirmation always need approval
+    if step.requires_confirmation {
+        return SopRunAction::WaitApproval {
+            run_id,
+            step: step.clone(),
+            context,
+        };
+    }
+
+    let effective_mode = step.mode.unwrap_or(sop.execution_mode);
+    let sop_needs_approval = execution_mode_needs_approval(sop.execution_mode, sop, step);
+    let mut needs_approval = execution_mode_needs_approval(effective_mode, sop, step);
+    if approval_mode == ApprovalMode::OutOfBandRequired && sop_needs_approval && !needs_approval {
+        needs_approval = true;
+    }
 
     if needs_approval {
         SopRunAction::WaitApproval {
@@ -1906,22 +2092,22 @@ fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: Strin
 // ── Step context formatting ─────────────────────────────────────
 
 /// Build the structured context message that gets injected into the agent.
-fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep) -> String {
+fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep, config: &SopConfig) -> String {
     let mut ctx = format!(
         "[SOP: {} (run {}) — Step {} of {}]\n\n",
         sop.name, run.run_id, step.number, run.total_steps
     );
 
-    // Untrusted trigger metadata (topic + payload) can carry injected
-    // instructions, so it is capped, sanitized, and framed before it ever
-    // reaches the model, never raw (audit finding E). A forged end-marker can't
-    // escape the block because sanitize_untrusted defangs the SOP_UNTRUSTED token;
-    // the marker id (run_id) is provenance/correlation only, NOT a secret.
-    ctx.push_str(&super::payload_safety::frame_trigger(
+    let marker_id = if run.frame_marker_id.is_empty() {
+        run.run_id.as_str()
+    } else {
+        run.frame_marker_id.as_str()
+    };
+    ctx.push_str(&ContentSafety::from_sop_config(config).frame_for_context(
         run.trigger_event.payload.as_deref(),
         run.trigger_event.topic.as_deref(),
         run.trigger_event.source,
-        &run.run_id,
+        marker_id,
     ));
 
     // Previous step summary
@@ -2749,10 +2935,17 @@ mod tests {
         };
 
         let action = engine.start_run("schema-in", event).unwrap();
+        let run_id = extract_run_id(&action).to_string();
 
         assert!(
             matches!(action, SopRunAction::Failed { ref reason, .. } if reason.contains("input schema validation failed"))
         );
+        let events = engine.run_events(&run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "step_schema_reject"
+                && event.payload["step"] == serde_json::json!(1)
+                && event.payload["phase"] == serde_json::json!("input")
+        }));
         assert!(engine.active_runs().is_empty());
         assert_eq!(engine.finished_runs(None)[0].status, SopRunStatus::Failed);
     }
@@ -2784,6 +2977,12 @@ mod tests {
         assert!(
             matches!(action, SopRunAction::Failed { ref reason, .. } if reason.contains("output schema validation failed"))
         );
+        let events = engine.run_events(&run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "step_schema_reject"
+                && event.payload["step"] == serde_json::json!(1)
+                && event.payload["phase"] == serde_json::json!("output")
+        }));
         assert!(engine.active_runs().is_empty());
         assert_eq!(engine.finished_runs(None)[0].status, SopRunStatus::Failed);
     }
@@ -2851,6 +3050,12 @@ mod tests {
             matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 3),
             "explicit routing should select step 3 instead of the linear step 2"
         );
+        let events = engine.run_events(&run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "step_promoted"
+                && event.payload["from_step"] == serde_json::json!(1)
+                && event.payload["to_step"] == serde_json::json!(3)
+        }));
         assert_eq!(engine.active_runs()[&run_id].current_step, 3);
     }
 
@@ -2879,6 +3084,10 @@ mod tests {
             matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 1),
             "initial failed attempt should allow the first retry of step 1"
         );
+        let events = engine.run_events(&run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "step_retry" && event.payload["step"] == serde_json::json!(1)
+        }));
         assert_eq!(engine.active_runs()[&run_id].current_step, 1);
 
         let action = engine
@@ -2976,6 +3185,12 @@ mod tests {
                 .iter()
                 .any(|result| result.step_number == 2 && result.status == SopStepStatus::Skipped)
         );
+        let events = engine.run_events(&run_id).unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "step_skipped"
+                && event.payload["step"] == serde_json::json!(2)
+                && event.payload["status"] == serde_json::json!("pending")
+        }));
     }
 
     #[test]
@@ -3210,6 +3425,45 @@ mod tests {
         assert!(matches!(action, SopRunAction::WaitApproval { .. }));
     }
 
+    #[test]
+    fn step_mode_can_tighten_auto_step() {
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[0].mode = Some(SopExecutionMode::StepByStep);
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+    }
+
+    #[test]
+    fn step_mode_can_relax_step_by_step_step() {
+        let mut sop = test_sop("s1", SopExecutionMode::StepByStep, SopPriority::Normal);
+        sop.steps[0].mode = Some(SopExecutionMode::Auto);
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+
+        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+    }
+
+    #[test]
+    fn out_of_band_required_prevents_step_auto_relaxing_gate() {
+        let mut sop = test_sop("s1", SopExecutionMode::StepByStep, SopPriority::Normal);
+        sop.steps[0].mode = Some(SopExecutionMode::Auto);
+        let mut engine = engine_with_config_sops(
+            SopConfig {
+                approval_mode: ApprovalMode::OutOfBandRequired,
+                ..SopConfig::default()
+            },
+            vec![sop],
+        );
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+    }
+
     // ── Approve ─────────────────────────────────────────
 
     #[test]
@@ -3259,6 +3513,7 @@ mod tests {
             run_id: "run-001".into(),
             sop_name: "pump-shutdown".into(),
             trigger_event: manual_event(),
+            frame_marker_id: "marker-001".into(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: 2,
@@ -3268,7 +3523,7 @@ mod tests {
             waiting_since: None,
             llm_calls_saved: 0,
         };
-        let ctx = format_step_context(&sop, &run, &sop.steps[0]);
+        let ctx = format_step_context(&sop, &run, &sop.steps[0], &SopConfig::default());
         assert!(ctx.contains("pump-shutdown"));
         assert!(ctx.contains("Step 1 of 2"));
         assert!(ctx.contains("Step one"));
@@ -4240,6 +4495,7 @@ type = "manual"
                 payload: None,
                 timestamp: now_iso8601(),
             },
+            frame_marker_id: "marker-restore".to_string(),
             status: SopRunStatus::WaitingApproval,
             current_step: 1,
             total_steps: 2,
@@ -4281,6 +4537,7 @@ type = "manual"
                 payload: None,
                 timestamp: now_iso8601(),
             },
+            frame_marker_id: "marker-persist".to_string(),
             status: SopRunStatus::Running,
             current_step: 0,
             total_steps: 2,
