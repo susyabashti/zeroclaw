@@ -691,14 +691,6 @@ mod tests {
         Arc::new(NativeRuntime::new())
     }
 
-    fn test_runtime_context() -> HashMap<String, String> {
-        HashMap::new()
-    }
-
-    fn test_runtime_secrets() -> HashMap<String, String> {
-        HashMap::new()
-    }
-
     #[cfg(windows)]
     fn stdin_reader_command() -> &'static str {
         "more"
