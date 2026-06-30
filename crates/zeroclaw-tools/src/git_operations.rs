@@ -55,10 +55,10 @@ impl GitOperationsTool {
     // Single source of truth for filtering and hierarchy merging
     fn apply_sanitized(&mut self, incoming: HashMap<String, String>, overwrite: bool) {
         for (key, val) in incoming {
-            if ALLOWED_GIT_ENV_VARS.contains(&key.as_str()) {
-                if overwrite || !self.git_env_overrides.contains_key(&key) {
-                    self.git_env_overrides.insert(key, val);
-                }
+            if ALLOWED_GIT_ENV_VARS.contains(&key.as_str())
+                && (overwrite || !self.git_env_overrides.contains_key(&key))
+            {
+                self.git_env_overrides.insert(key, val);
             }
         }
     }
