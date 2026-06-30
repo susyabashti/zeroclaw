@@ -572,7 +572,19 @@ dependencies = [
  "async-io 1.13.0",
  "async-trait",
  "futures-core",
- "reactor-trait",
+ "reactor-trait 1.1.0",
+]
+
+[[package]]
+name = "async-reactor-trait"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ab52004af1f14a170088bd9e10a2d3b2f2307ce04320e58a6ce36ee531be625"
+dependencies = [
+ "async-io 2.6.0",
+ "async-trait",
+ "futures-core",
+ "reactor-trait 3.1.1",
 ]
 
 [[package]]
@@ -5123,7 +5135,7 @@ checksum = "02d2aa4725b9607915fa1a73e940710a3be6af508ce700e56897cbe8847fbb07"
 dependencies = [
  "amq-protocol",
  "async-global-executor-trait",
- "async-reactor-trait",
+ "async-reactor-trait 1.1.0",
  "async-trait",
  "executor-trait",
  "flume",
@@ -5131,7 +5143,7 @@ dependencies = [
  "futures-io",
  "parking_lot",
  "pinky-swear",
- "reactor-trait",
+ "reactor-trait 1.1.0",
  "serde",
  "tracing",
  "waker-fn",
@@ -8012,6 +8024,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "reactor-trait"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b1c85237926dd82e8bc3634240ecf2236ea81e904b3d83cdb1df974af9af293"
+dependencies = [
+ "async-io 2.6.0",
+ "async-trait",
+ "executor-trait",
+ "flume",
+ "futures-core",
+ "futures-io",
+]
+
+[[package]]
 name = "readlock"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10256,7 +10282,7 @@ dependencies = [
  "async-trait",
  "futures-core",
  "futures-io",
- "reactor-trait",
+ "reactor-trait 1.1.0",
  "tokio",
  "tokio-stream",
 ]
@@ -13169,7 +13195,7 @@ dependencies = [
  "aes 0.8.4",
  "anyhow",
  "async-imap",
- "async-reactor-trait",
+ "async-reactor-trait 3.1.1",
  "async-trait",
  "axum",
  "base64 0.22.1",
