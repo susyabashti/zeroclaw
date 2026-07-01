@@ -1,6 +1,7 @@
 //! MCP transport abstraction — supports stdio, SSE, and HTTP transports.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -112,9 +113,15 @@ pub struct StdioTransport {
 }
 
 impl StdioTransport {
-    pub fn new(config: &McpServerConfig) -> Result<Self> {
+    pub fn new(
+        config: &McpServerConfig,
+        runtime_context: &HashMap<String, String>,
+        runtime_secrets: &HashMap<String, String>,
+    ) -> Result<Self> {
         let mut child = Command::new(&config.command)
             .args(&config.args)
+            .envs(runtime_context)
+            .envs(runtime_secrets)
             .envs(&config.env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1085,9 +1092,17 @@ impl McpTransportConn for SseTransport {
 // ── Factory ──────────────────────────────────────────────────────────────
 
 /// Create a transport based on config.
-pub fn create_transport(config: &McpServerConfig) -> Result<Box<dyn McpTransportConn>> {
+pub fn create_transport(
+    config: &McpServerConfig,
+    runtime_context: &HashMap<String, String>,
+    runtime_secrets: &HashMap<String, String>,
+) -> Result<Box<dyn McpTransportConn>> {
     match config.transport {
-        McpTransport::Stdio => Ok(Box::new(StdioTransport::new(config)?)),
+        McpTransport::Stdio => Ok(Box::new(StdioTransport::new(
+            config,
+            runtime_context,
+            runtime_secrets,
+        )?)),
         McpTransport::Http => Ok(Box::new(HttpTransport::new(config)?)),
         McpTransport::Sse => Ok(Box::new(SseTransport::new(config)?)),
     }

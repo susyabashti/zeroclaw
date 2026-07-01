@@ -182,14 +182,19 @@ pub struct McpServer {
 
 impl McpServer {
     /// Connect to the server, perform the initialize handshake, and fetch the tool list.
-    pub async fn connect(config: McpServerConfig) -> Result<Self> {
+    pub async fn connect(
+        config: McpServerConfig,
+        runtime_context: &HashMap<String, String>,
+        runtime_secrets: &HashMap<String, String>,
+    ) -> Result<Self> {
         // Create transport based on config
-        let mut transport = create_transport(&config).with_context(|| {
-            format!(
-                "failed to create transport for MCP server `{}`",
-                config.name
-            )
-        })?;
+        let mut transport = create_transport(&config, runtime_context, runtime_secrets)
+            .with_context(|| {
+                format!(
+                    "failed to create transport for MCP server `{}`",
+                    config.name
+                )
+            })?;
 
         // Initialize handshake (initialize + initialized notification)
         let capabilities = handshake(transport.as_mut(), &config.name).await?;
@@ -566,13 +571,17 @@ pub struct McpRegistry {
 
 impl McpRegistry {
     /// Connect to all configured servers. Non-fatal: failures are logged and skipped.
-    pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
+    pub async fn connect_all(
+        configs: &[McpServerConfig],
+        runtime_context: &HashMap<String, String>,
+        runtime_secrets: &HashMap<String, String>,
+    ) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
         let mut server_index = HashMap::new();
 
         for config in configs {
-            match McpServer::connect(config.clone()).await {
+            match McpServer::connect(config.clone(), runtime_context, runtime_secrets).await {
                 Ok(server) => {
                     let server_idx = servers.len();
                     server_index.insert(config.name.clone(), server_idx);

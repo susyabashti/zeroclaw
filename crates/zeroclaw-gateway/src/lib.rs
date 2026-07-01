@@ -498,6 +498,14 @@ async fn append_scoped_mcp_tools(
         .model_provider_for_agent(agent_alias)
         .and_then(|p| p.model.clone())
         .unwrap_or_default();
+    let runtime_context = config
+        .agent(agent_alias)
+        .map(|a| a.runtime_context.clone())
+        .unwrap_or_default();
+    let runtime_secrets = config
+        .agent(agent_alias)
+        .map(|a| a.runtime_secrets.clone())
+        .unwrap_or_default();
     let attribution_span =
         ::zeroclaw_log::attribution_span!(&zeroclaw_runtime::agent::AgentAttribution(agent_alias));
     ::zeroclaw_log::scope!(
@@ -505,7 +513,7 @@ async fn append_scoped_mcp_tools(
         model: mcp_model,
         =>
         async {
-            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+            match tools::McpRegistry::connect_all(&agent_mcp_servers, &runtime_context, &runtime_secrets).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     if config.mcp.deferred_loading {

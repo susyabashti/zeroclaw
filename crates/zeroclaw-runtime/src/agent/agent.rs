@@ -1503,7 +1503,23 @@ impl Agent {
                     agent_mcp_servers.len()
                 )
             );
-            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+
+            let runtime_context = config
+                .agent(agent_alias)
+                .map(|a| a.runtime_context.clone())
+                .unwrap_or_default();
+            let runtime_secrets = config
+                .agent(agent_alias)
+                .map(|a| a.runtime_secrets.clone())
+                .unwrap_or_default();
+
+            match tools::McpRegistry::connect_all(
+                &agent_mcp_servers,
+                &runtime_context,
+                &runtime_secrets,
+            )
+            .await
+            {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
