@@ -399,13 +399,19 @@ impl ToolSearchTool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::mcp_client::McpRegistry;
     use crate::mcp_deferred::DeferredMcpToolStub;
     use crate::mcp_protocol::McpToolDef;
 
     async fn make_deferred_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
-        let registry = Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+        let registry = Arc::new(
+            McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
+                .await
+                .unwrap(),
+        );
         DeferredMcpToolSet { stubs, registry }
     }
 

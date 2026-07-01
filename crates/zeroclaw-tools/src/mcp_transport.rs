@@ -1464,7 +1464,7 @@ mod tests {
             command: "/usr/bin/zeroclaw_nonexistent_binary_abc123".into(),
             ..Default::default()
         };
-        let result = create_transport(&config);
+        let result = create_transport(&config, &HashMap::new(), &HashMap::new());
         assert!(result.is_err());
     }
 
@@ -1475,7 +1475,7 @@ mod tests {
             transport: McpTransport::Http,
             ..Default::default()
         };
-        assert!(create_transport(&config).is_err());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_err());
     }
 
     #[test]
@@ -1485,7 +1485,7 @@ mod tests {
             transport: McpTransport::Sse,
             ..Default::default()
         };
-        assert!(create_transport(&config).is_err());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_err());
     }
 
     #[test]
@@ -1497,7 +1497,7 @@ mod tests {
             ..Default::default()
         };
         // Build should succeed even if server isn't running
-        assert!(create_transport(&config).is_ok());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_ok());
     }
 
     #[test]
@@ -1508,7 +1508,7 @@ mod tests {
             url: Some("http://localhost:9999/sse".into()),
             ..Default::default()
         };
-        assert!(create_transport(&config).is_ok());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_ok());
     }
 
     // ── HTTP session id whitespace handling ───────────────────────────────────
@@ -1670,5 +1670,45 @@ mod tests {
         assert!(guard.message_url.is_none());
         assert!(!guard.message_url_from_endpoint);
         assert!(guard.pending.is_empty());
+    }
+
+    // ── stdio env precedence ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_env_precedence() -> Result<()> {
+        let mut runtime_context = HashMap::new();
+        runtime_context.insert("KEY".to_string(), "context_val".to_string());
+
+        let mut runtime_secrets = HashMap::new();
+        runtime_secrets.insert("KEY".to_string(), "secret_val".to_string());
+
+        let mut config_env = HashMap::new();
+        config_env.insert("KEY".to_string(), "config_val".to_string());
+
+        let config = McpServerConfig {
+            name: "test-server".to_string(),
+            command: "env".to_string(), // The 'env' command prints all vars
+            args: vec![],
+            env: config_env,
+            transport: McpTransport::Stdio,
+            ..Default::default()
+        };
+
+        // 2. Initialize transport
+        let mut transport = StdioTransport::new(&config, &runtime_context, &runtime_secrets)?;
+
+        // 3. Read output from the 'env' command
+        let mut found_val = None;
+        while let Ok(line) = transport.recv_raw().await {
+            if line.starts_with("KEY=") {
+                found_val = Some(line.trim_start_matches("KEY=").to_string());
+                break;
+            }
+        }
+
+        // 4. Verify precedence (Config > Secrets > Context)
+        assert_eq!(found_val.unwrap(), "config_val");
+
+        Ok(())
     }
 }

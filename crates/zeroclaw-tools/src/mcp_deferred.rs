@@ -442,7 +442,11 @@ mod tests {
             registry: std::sync::Arc::new(
                 tokio::runtime::Runtime::new()
                     .unwrap()
-                    .block_on(McpRegistry::connect_all(&[]))
+                    .block_on(McpRegistry::connect_all(
+                        &[],
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ))
                     .unwrap(),
             ),
         };
@@ -460,7 +464,11 @@ mod tests {
             registry: std::sync::Arc::new(
                 tokio::runtime::Runtime::new()
                     .unwrap()
-                    .block_on(McpRegistry::connect_all(&[]))
+                    .block_on(McpRegistry::connect_all(
+                        &[],
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ))
                     .unwrap(),
             ),
         };
@@ -479,7 +487,11 @@ mod tests {
             registry: std::sync::Arc::new(
                 tokio::runtime::Runtime::new()
                     .unwrap()
-                    .block_on(McpRegistry::connect_all(&[]))
+                    .block_on(McpRegistry::connect_all(
+                        &[],
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ))
                     .unwrap(),
             ),
         };
@@ -506,7 +518,11 @@ mod tests {
             registry: std::sync::Arc::new(
                 tokio::runtime::Runtime::new()
                     .unwrap()
-                    .block_on(McpRegistry::connect_all(&[]))
+                    .block_on(McpRegistry::connect_all(
+                        &[],
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ))
                     .unwrap(),
             ),
         };
@@ -532,7 +548,11 @@ mod tests {
             registry: std::sync::Arc::new(
                 tokio::runtime::Runtime::new()
                     .unwrap()
-                    .block_on(McpRegistry::connect_all(&[]))
+                    .block_on(McpRegistry::connect_all(
+                        &[],
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ))
                     .unwrap(),
             ),
         };
@@ -554,7 +574,11 @@ mod tests {
             registry: std::sync::Arc::new(
                 tokio::runtime::Runtime::new()
                     .unwrap()
-                    .block_on(McpRegistry::connect_all(&[]))
+                    .block_on(McpRegistry::connect_all(
+                        &[],
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ))
                     .unwrap(),
             ),
         };
@@ -573,7 +597,11 @@ mod tests {
             registry: std::sync::Arc::new(
                 tokio::runtime::Runtime::new()
                     .unwrap()
-                    .block_on(McpRegistry::connect_all(&[]))
+                    .block_on(McpRegistry::connect_all(
+                        &[],
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    ))
                     .unwrap(),
             ),
         };
