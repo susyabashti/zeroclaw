@@ -228,6 +228,9 @@ impl McpTransportConn for StdioTransport {
 
     async fn close(&mut self) -> Result<()> {
         let _ = self.stdin.shutdown().await;
+
+        // Await termination so the OS reaps the process descriptor slot immediately
+        let _ = self.child.wait().await;
         Ok(())
     }
 }
