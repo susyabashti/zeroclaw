@@ -107,7 +107,7 @@ pub trait McpTransportConn: Send + Sync {
 
 /// Stdio-based transport (spawn local process).
 pub struct StdioTransport {
-    child: Child,
+    child: Option<Child>,
     stdin: tokio::process::ChildStdin,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
 }
@@ -159,7 +159,7 @@ impl StdioTransport {
         let stdout_lines = BufReader::new(stdout).lines();
 
         Ok(Self {
-            child,
+            child: Some(child),
             stdin,
             stdout_lines,
         })
@@ -237,8 +237,26 @@ impl McpTransportConn for StdioTransport {
         let _ = self.stdin.shutdown().await;
 
         // Await termination so the OS reaps the process descriptor slot immediately
-        let _ = self.child.wait().await;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait().await;
+        }
         Ok(())
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        // If close() was already called, child will be None and this is a clean no-op
+        if let Some(mut child) = self.child.take() {
+            // Check if the process has already exited and reap it immediately if so
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+
+            // Otherwise, make sure it's killed and try a quick non-blocking reap
+            let _ = child.start_kill();
+            let _ = child.try_wait();
+        }
     }
 }
 
@@ -1731,24 +1749,30 @@ async fn stdio_transport_leaves_zombie_if_not_explicitly_awaited() {
     let mut transport = StdioTransport::new(&config).expect("Failed to initialize transport");
 
     #[cfg(target_os = "linux")]
-    let pid = transport.child.id().expect("Valid PID required");
+    let pid = transport
+        .child
+        .as_ref()
+        .and_then(|c| c.id())
+        .expect("Valid PID required");
 
-    // Simulate the old bugged behavior: only shut down stdin, no wait loop
+    // Simulate the old bugged behavior: only shut down stdin, bypassing wait/drop
     use tokio::io::AsyncWriteExt;
     let _ = transport.stdin.shutdown().await;
 
     #[cfg(target_os = "linux")]
     {
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
         let proc_path = std::path::Path::new(&format!("/proc/{}", pid));
         assert!(
             proc_path.exists(),
-            "Without calling wait(), the process should linger as a zombie entry in /proc"
+            "Without calling wait() or dropping the transport, the process should linger as a zombie entry in /proc"
         );
     }
 
-    // Clean up resource so we don't leak it during the test execution
-    let _ = transport.child.wait().await;
+    // Clean up resource via explicit wait so we don't leak it during the test execution
+    if let Some(mut child) = transport.child.take() {
+        let _ = child.wait().await;
+    }
 }
 
 #[tokio::test]
@@ -1764,7 +1788,11 @@ async fn stdio_transport_close_reaps_process_instantly() {
     let mut transport = StdioTransport::new(&config).expect("Failed to initialize transport");
 
     #[cfg(target_os = "linux")]
-    let pid = transport.child.id().expect("Valid PID required");
+    let pid = transport
+        .child
+        .as_ref()
+        .and_then(|c| c.id())
+        .expect("Valid PID required");
 
     // Invoke the updated close logic containing our new wait call
     transport
@@ -1774,12 +1802,55 @@ async fn stdio_transport_close_reaps_process_instantly() {
 
     #[cfg(target_os = "linux")]
     {
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
         let proc_path = std::path::Path::new(&format!("/proc/{}", pid));
         assert!(
             !proc_path.exists(),
             "Process PID {} should be completely purged from /proc by close()",
             pid
         );
+    }
+}
+
+#[tokio::test]
+async fn stdio_transport_drop_reaps_process_implicitly() {
+    let config = McpServerConfig {
+        name: "test-implicit-drop-reap".into(),
+        transport: McpTransport::Stdio,
+        command: "sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        ..Default::default()
+    };
+
+    // If we are on Linux, we track the PID to verify the kernel's process table entry disappears.
+    #[cfg(target_os = "linux")]
+    {
+        let pid;
+        {
+            let transport = StdioTransport::new(&config).expect("Failed to initialize transport");
+            pid = transport
+                .child
+                .as_ref()
+                .and_then(|c| c.id())
+                .expect("Valid PID required");
+            // transport falls out of scope here, triggering implicit Drop
+        }
+
+        // Give the kernel a tiny slice to handle the synchronous reap lifecycle
+        tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+
+        let proc_path = std::path::Path::new(&format!("/proc/{}", pid));
+        assert!(
+            !proc_path.exists(),
+            "Process PID {} should be instantly reaped by the Drop safety net when dropped out of scope",
+            pid
+        );
+    }
+
+    // On non-Linux platforms, we just verify that the lifecycle doesn't crash or panic when dropped.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _transport = StdioTransport::new(&config).expect("Failed to initialize transport");
+        // falls out of scope implicitly here
     }
 }

@@ -5,7 +5,7 @@ use directories::UserDirs;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -46,7 +46,9 @@ const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 const CLAWHUB_DOMAIN: &str = "clawhub.ai";
 const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
-const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
+const MAX_SKILL_ZIP_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_SKILL_ZIP_ENTRIES: usize = 500;
+const MAX_SKILL_ZIP_EXPANSION_RATIO: u64 = 10;
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -96,8 +98,14 @@ pub struct Skill {
 /// dashboard can show the same reason without re-running the audit. (#7963)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillDropReason {
-    /// `audit_*` returned Ok(report) with findings; String = report.summary().
-    AuditFindings(String),
+    /// `audit_*` returned Ok(report) with findings. `summary` = report.summary();
+    /// `scripts_blocked` is true when the secure-default script policy is the
+    /// blocker, so consumers can offer the `skills.allow_scripts = true` hint
+    /// without re-parsing the human-readable summary.
+    AuditFindings {
+        summary: String,
+        scripts_blocked: bool,
+    },
     /// `audit_*` returned Err (unauditable); String = error message.
     AuditError(String),
     /// Audit passed but SKILL.toml/manifest.toml failed to parse.
@@ -407,11 +415,10 @@ pub fn print_install_tier_banner(name: &str, version: Option<&str>, tier: SkillT
 }
 
 /// Emit a user-visible warning when a skill directory is skipped due to audit
-/// findings. When the findings mention blocked scripts and `allow_scripts` is
-/// `false`, the message includes actionable remediation guidance so users know
-/// how to enable their skill.
-fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
-    let scripts_blocked = summary.contains("script-like files are blocked");
+/// findings. When `scripts_blocked` is set and `allow_scripts` is `false`, the
+/// message includes actionable remediation guidance so users know how to enable
+/// their skill.
+fn warn_skipped_skill(path: &Path, summary: &str, scripts_blocked: bool, allow_scripts: bool) {
     if scripts_blocked && !allow_scripts {
         ::zeroclaw_log::record!(
             WARN,
@@ -753,11 +760,15 @@ fn load_skills_from_directory_uncached(
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
-                warn_skipped_skill(&path, &summary, allow_scripts);
+                let scripts_blocked = report.scripts_blocked;
+                warn_skipped_skill(&path, &summary, scripts_blocked, allow_scripts);
                 dropped.push(DroppedSkill {
                     name: dir_stem(&path),
                     origin_hint: "workspace".into(),
-                    reason: SkillDropReason::AuditFindings(summary),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
                     location: Some(path.clone()),
                 });
                 continue;
@@ -878,11 +889,15 @@ fn load_open_skills_from_directory_uncached(
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
-                warn_skipped_skill(&path, &summary, allow_scripts);
+                let scripts_blocked = report.scripts_blocked;
+                warn_skipped_skill(&path, &summary, scripts_blocked, allow_scripts);
                 dropped.push(DroppedSkill {
                     name: dir_stem(&path),
                     origin_hint: "open-skills".into(),
-                    reason: SkillDropReason::AuditFindings(summary),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
                     location: Some(path.clone()),
                 });
                 continue;
@@ -996,6 +1011,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<Dr
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
+                let scripts_blocked = report.scripts_blocked;
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1009,7 +1025,10 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<Dr
                 dropped.push(DroppedSkill {
                     name: dir_stem(&path),
                     origin_hint: "open-skills".into(),
-                    reason: SkillDropReason::AuditFindings(summary),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
                     location: Some(path.clone()),
                 });
                 continue;
@@ -2195,34 +2214,171 @@ fn is_unsafe_zip_entry_name(raw_name: &str) -> bool {
         || raw_name.contains(':')
 }
 
-/// Securely extract a downloaded skill zip into `dest`.
-///
-/// Rejects archives larger than `max_bytes` and any entry whose path could
-/// escape `dest`. On a rejected entry the partially-created `dest` is removed
-/// before returning. Shared by the ClawHub installer and unit-tested directly.
+fn checked_zip_size_add(total: u64, next: u64, label: &str) -> Result<u64> {
+    total
+        .checked_add(next)
+        .with_context(|| format!("skill zip rejected: {label} size overflow"))
+}
+
+fn append_skill_zip_chunk(bytes: &mut Vec<u8>, chunk: &[u8], max_bytes: u64) -> Result<()> {
+    let current_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
+    let chunk_len = u64::try_from(chunk.len()).context("skill zip chunk length overflow")?;
+    let next_len = checked_zip_size_add(current_len, chunk_len, "downloaded")?;
+    if next_len > max_bytes {
+        anyhow::bail!("skill zip rejected: too large ({next_len} bytes > {max_bytes})");
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn download_skill_zip_bytes(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    if let Some(len) = response.content_length()
+        && len > max_bytes
+    {
+        anyhow::bail!("skill zip rejected: too large ({len} bytes > {max_bytes})");
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read skill zip response body")?
+    {
+        append_skill_zip_chunk(&mut bytes, &chunk, max_bytes)?;
+    }
+    Ok(bytes)
+}
+
+fn exceeds_skill_zip_ratio(uncompressed_bytes: u64, compressed_bytes: u64) -> bool {
+    compressed_bytes > 0
+        && uncompressed_bytes > compressed_bytes.saturating_mul(MAX_SKILL_ZIP_EXPANSION_RATIO)
+}
+
+fn validate_skill_zip_limits<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    max_bytes: u64,
+) -> Result<u64> {
+    let entry_count = archive.len();
+    if entry_count > MAX_SKILL_ZIP_ENTRIES {
+        anyhow::bail!(
+            "skill zip rejected: too many entries ({} > {})",
+            entry_count,
+            MAX_SKILL_ZIP_ENTRIES
+        );
+    }
+
+    let mut compressed_bytes = 0_u64;
+    let mut uncompressed_bytes = 0_u64;
+    for i in 0..entry_count {
+        let entry = archive.by_index(i)?;
+        let raw_name = entry.name().to_string();
+        if is_unsafe_zip_entry_name(&raw_name) {
+            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
+        }
+
+        let entry_compressed_bytes = entry.compressed_size();
+        let entry_uncompressed_bytes = entry.size();
+        if entry_uncompressed_bytes > 0 && entry_compressed_bytes == 0 {
+            anyhow::bail!(
+                "skill zip rejected: entry '{}' has invalid compression ratio",
+                raw_name
+            );
+        }
+
+        compressed_bytes =
+            checked_zip_size_add(compressed_bytes, entry_compressed_bytes, "compressed")?;
+        uncompressed_bytes =
+            checked_zip_size_add(uncompressed_bytes, entry_uncompressed_bytes, "uncompressed")?;
+
+        if uncompressed_bytes > max_bytes {
+            anyhow::bail!(
+                "skill zip rejected: extracted size too large ({} bytes > {})",
+                uncompressed_bytes,
+                max_bytes
+            );
+        }
+        if exceeds_skill_zip_ratio(uncompressed_bytes, compressed_bytes) {
+            anyhow::bail!(
+                "skill zip rejected: expansion ratio exceeds {}x",
+                MAX_SKILL_ZIP_EXPANSION_RATIO
+            );
+        }
+    }
+
+    Ok(compressed_bytes)
+}
+
 fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()> {
-    if bytes.len() as u64 > max_bytes {
+    let archive_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
+    if archive_len > max_bytes {
         anyhow::bail!(
             "skill zip rejected: too large ({} bytes > {})",
-            bytes.len(),
+            archive_len,
             max_bytes
         );
     }
 
-    std::fs::create_dir_all(dest)?;
-
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
+    let compressed_bytes = validate_skill_zip_limits(&mut archive, max_bytes)?;
 
+    std::fs::create_dir_all(dest)?;
+    let result = extract_validated_skill_zip(&mut archive, dest, max_bytes, compressed_bytes);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(dest);
+    }
+    result
+}
+
+fn copy_zip_entry_bounded<R: Read, W: Write>(
+    entry: &mut R,
+    output: &mut W,
+    extracted_bytes: &mut u64,
+    max_bytes: u64,
+    compressed_bytes: u64,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read_bytes = entry.read(&mut buffer)?;
+        if read_bytes == 0 {
+            return Ok(());
+        }
+
+        let read_bytes = u64::try_from(read_bytes).context("skill zip read length overflow")?;
+        let next_extracted = checked_zip_size_add(*extracted_bytes, read_bytes, "extracted")?;
+        if next_extracted > max_bytes {
+            anyhow::bail!(
+                "skill zip rejected: extracted size too large ({} bytes > {})",
+                next_extracted,
+                max_bytes
+            );
+        }
+        if exceeds_skill_zip_ratio(next_extracted, compressed_bytes) {
+            anyhow::bail!(
+                "skill zip rejected: expansion ratio exceeds {}x",
+                MAX_SKILL_ZIP_EXPANSION_RATIO
+            );
+        }
+
+        let read_len = usize::try_from(read_bytes).context("skill zip write length overflow")?;
+        output.write_all(&buffer[..read_len])?;
+        *extracted_bytes = next_extracted;
+    }
+}
+
+fn extract_validated_skill_zip<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    dest: &Path,
+    max_bytes: u64,
+    compressed_bytes: u64,
+) -> Result<()> {
+    let mut extracted_bytes = 0_u64;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let raw_name = entry.name().to_string();
-
-        if is_unsafe_zip_entry_name(&raw_name) {
-            let _ = std::fs::remove_dir_all(dest);
-            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
-        }
-
         let out_path = dest.join(&raw_name);
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)?;
@@ -2239,7 +2395,13 @@ fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()>
                 out_path.display().to_string()
             )
         })?;
-        std::io::copy(&mut entry, &mut out_file)?;
+        copy_zip_entry_bounded(
+            &mut entry,
+            &mut out_file,
+            &mut extracted_bytes,
+            max_bytes,
+            compressed_bytes,
+        )?;
     }
 
     Ok(())
@@ -2278,8 +2440,8 @@ pub async fn install_clawhub_skill_source(
         anyhow::bail!("ClawHub download failed (HTTP {})", resp.status());
     }
 
-    let bytes = resp.bytes().await?.to_vec();
-    extract_zip_secure(bytes, &installed_dir, MAX_CLAWHUB_ZIP_BYTES)?;
+    let bytes = download_skill_zip_bytes(resp, MAX_SKILL_ZIP_BYTES).await?;
+    extract_zip_secure(bytes, &installed_dir, MAX_SKILL_ZIP_BYTES)?;
 
     let has_manifest = installed_dir.join("SKILL.md").exists()
         || installed_dir.join("SKILL.toml").exists()
@@ -2697,6 +2859,53 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+    use std::io::{self, Write};
+
+    struct CountingWriter {
+        written: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.written += buffer.len();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ChunkReader {
+        chunks: Vec<Vec<u8>>,
+        index: usize,
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.get(self.index) else {
+                return Ok(0);
+            };
+            let copied = chunk.len().min(buffer.len());
+            buffer[..copied].copy_from_slice(&chunk[..copied]);
+            self.index += 1;
+            Ok(copied)
+        }
+    }
+
+    fn make_skill_zip(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+            for (name, body) in entries {
+                writer.start_file(*name, opts).unwrap();
+                writer.write_all(body).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
 
     #[test]
     fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
@@ -2830,23 +3039,31 @@ mod registry_tests {
     }
 
     #[test]
+    fn test_append_skill_zip_chunk_accepts_within_limit() {
+        let mut bytes = b"abc".to_vec();
+        append_skill_zip_chunk(&mut bytes, b"def", 6).unwrap();
+        assert_eq!(bytes, b"abcdef");
+    }
+
+    #[test]
+    fn test_append_skill_zip_chunk_rejects_oversize() {
+        let mut bytes = b"abc".to_vec();
+        let err = append_skill_zip_chunk(&mut bytes, b"defg", 6)
+            .expect_err("oversize chunk must be rejected");
+        assert!(err.to_string().contains("too large"), "got: {err}");
+        assert_eq!(bytes, b"abc");
+    }
+
+    #[test]
     fn test_extract_zip_secure_happy_path() {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        {
-            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("SKILL.md", opts).unwrap();
-            w.write_all(b"# demo").unwrap();
-            w.start_file("scripts/run.txt", opts).unwrap();
-            w.write_all(b"echo hi").unwrap();
-            w.finish().unwrap();
-        }
+        let buf = make_skill_zip(
+            &[("SKILL.md", b"# demo"), ("scripts/run.txt", b"echo hi")],
+            zip::CompressionMethod::Stored,
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("skill");
-        extract_zip_secure(buf, &dest, MAX_CLAWHUB_ZIP_BYTES).unwrap();
+        extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
@@ -2859,17 +3076,8 @@ mod registry_tests {
     }
 
     #[test]
-    fn test_extract_zip_secure_rejects_oversize() {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        {
-            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("SKILL.md", opts).unwrap();
-            w.write_all(b"# demo").unwrap();
-            w.finish().unwrap();
-        }
+    fn test_extract_zip_secure_rejects_oversize_archive() {
+        let buf = make_skill_zip(&[("SKILL.md", b"# demo")], zip::CompressionMethod::Stored);
 
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("skill");
@@ -2879,6 +3087,181 @@ mod registry_tests {
             !dest.exists(),
             "dest must not be created when the zip is rejected for size"
         );
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_too_many_entries() {
+        let entries: Vec<(String, Vec<u8>)> = (0..=MAX_SKILL_ZIP_ENTRIES)
+            .map(|index| (format!("files/{index}.txt"), b"x".to_vec()))
+            .collect();
+        let entry_refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_slice()))
+            .collect();
+        let buf = make_skill_zip(&entry_refs, zip::CompressionMethod::Stored);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("zip with too many entries must be rejected");
+        assert!(err.to_string().contains("too many entries"), "got: {err}");
+        assert!(!dest.exists(), "dest must not be created for rejected zip");
+    }
+
+    #[test]
+    fn test_copy_zip_entry_bounded_stops_before_limit_overwrite() {
+        let payload = vec![b'a'; 1024];
+        let mut reader = Cursor::new(payload);
+        let mut writer = CountingWriter { written: 0 };
+        let mut extracted_bytes = 0;
+
+        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
+            .expect_err("bounded copy must reject before writing over the cap");
+
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert_eq!(writer.written, 0);
+        assert_eq!(extracted_bytes, 0);
+    }
+
+    #[test]
+    fn test_copy_zip_entry_bounded_preserves_prior_valid_write() {
+        let mut reader = ChunkReader {
+            chunks: vec![vec![b'a'; 400], vec![b'b'; 200]],
+            index: 0,
+        };
+        let mut writer = CountingWriter { written: 0 };
+        let mut extracted_bytes = 0;
+
+        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
+            .expect_err("bounded copy must reject the chunk that crosses the cap");
+
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert_eq!(writer.written, 400);
+        assert_eq!(extracted_bytes, 400);
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_extracted_size_limit() {
+        let payload = vec![b'a'; 1024];
+        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, 500)
+            .expect_err("zip exceeding extracted size limit must be rejected");
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert!(!dest.exists(), "dest must not be created for rejected zip");
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_expansion_ratio() {
+        let payload = vec![b'a'; 1024];
+        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("zip exceeding expansion ratio must be rejected");
+        assert!(err.to_string().contains("expansion ratio"), "got: {err}");
+        assert!(!dest.exists(), "dest must not be created for rejected zip");
+    }
+
+    /// Regression: an entry whose central directory understates the real
+    /// uncompressed size must be rejected during extraction, not silently
+    /// truncated on disk.
+    #[test]
+    fn test_extract_zip_secure_rejects_lying_declared_size() {
+        // 60 MiB payload, but we patch the central directory to claim 1 byte.
+        let payload = vec![b'a'; 60 * 1024 * 1024];
+        let mut buf = make_skill_zip(&[("big.bin", &payload)], zip::CompressionMethod::Stored);
+        patch_zip_central_directory_uncompressed_size(&mut buf, 1);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("lying declared size must be rejected during extraction");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected size error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when lying declared size is rejected"
+        );
+    }
+
+    /// Regression: multiple entries can each declare a small uncompressed size
+    /// while their actual payloads collectively exceed the cap. The cumulative
+    /// guard must count bytes actually extracted, not declared sizes.
+    #[test]
+    fn test_extract_zip_secure_rejects_multi_entry_lying_declared_size() {
+        const ENTRY_SIZE: usize = 10 * 1024 * 1024; // 10 MiB each
+        const ENTRY_COUNT: usize = 6; // 60 MiB total > 50 MiB cap
+        const LIED_SIZE: u32 = 8 * 1024 * 1024; // 48 MiB declared total < 50 MiB cap
+
+        let mut entries = Vec::new();
+        for i in 0..ENTRY_COUNT {
+            entries.push((format!("big{i}.bin"), vec![b'a'; ENTRY_SIZE]));
+        }
+        let entry_refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_slice()))
+            .collect();
+        let mut buf = make_skill_zip(&entry_refs, zip::CompressionMethod::Stored);
+        patch_all_zip_central_directory_uncompressed_sizes(&mut buf, LIED_SIZE);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("multi-entry lying declared sizes must be rejected");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected size error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when archive cap is exceeded"
+        );
+    }
+
+    /// Overwrite the uncompressed-size field in the first central-directory
+    /// header of a zip file.
+    fn patch_zip_central_directory_uncompressed_size(zip: &mut [u8], new_size: u32) {
+        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
+            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
+                let start = i + 24;
+                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
+                return;
+            }
+        }
+        panic!("central directory signature not found in test zip");
+    }
+
+    /// Overwrite the uncompressed-size field in every central-directory header
+    /// of a zip file.
+    fn patch_all_zip_central_directory_uncompressed_sizes(zip: &mut [u8], new_size: u32) {
+        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        let mut patched = 0;
+        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
+            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
+                let start = i + 24;
+                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
+                patched += 1;
+            }
+        }
+        if patched == 0 {
+            panic!("central directory signature not found in test zip");
+        }
     }
 
     #[test]
@@ -3537,8 +3920,63 @@ description = "fine"
         ));
     }
 
-    /// Behavioral assertion for the open-skills swallow-site fix.
-    /// Same shape as the workspace test above; covers `load_open_skills_from_directory`.
+    /// #7861: a workspace skill bundling a shell script under the secure
+    /// default (`allow_scripts = false`) is dropped as an audit finding whose
+    /// summary carries the scripts-blocked marker, and is absent from the
+    /// loaded set. Flipping `allow_scripts = true` loads it and empties the
+    /// dropped set. This is what `zeroclaw skills list` surfaces as "Skipped".
+    #[test]
+    fn workspace_script_bundling_skill_reported_as_scripts_blocked_drop() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let script_dir = skills_dir.join("script-skill");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::write(
+            script_dir.join("SKILL.md"),
+            "---\nname: script-skill\ndescription: bundles a shell helper\n---\n# Script Skill\n",
+        )
+        .unwrap();
+        std::fs::write(script_dir.join("helper.sh"), "echo hi\n").unwrap();
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, false);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.contains(&"script-skill"),
+            "script-bundling skill must be dropped at the secure default; got: {names:?}"
+        );
+        assert_eq!(dropped.len(), 1, "the script skill must be reported");
+        assert_eq!(dropped[0].origin_hint, "workspace");
+        match &dropped[0].reason {
+            SkillDropReason::AuditFindings {
+                summary,
+                scripts_blocked,
+            } => {
+                assert!(
+                    *scripts_blocked,
+                    "reason must flag scripts as the blocker; got: {summary}"
+                );
+                assert!(
+                    summary.contains("script-like files are blocked"),
+                    "summary must describe the script block; got: {summary}"
+                );
+            }
+            other => panic!("expected AuditFindings, got: {other:?}"),
+        }
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, true);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"script-skill"),
+            "script-bundling skill must load once allow_scripts=true; got: {names:?}"
+        );
+        assert!(
+            dropped.is_empty(),
+            "no drops expected with allow_scripts=true; got: {dropped:?}"
+        );
+    }
     #[test]
     fn open_skills_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
