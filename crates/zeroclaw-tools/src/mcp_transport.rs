@@ -107,7 +107,7 @@ pub trait McpTransportConn: Send + Sync {
 
 /// Stdio-based transport (spawn local process).
 pub struct StdioTransport {
-    _child: Child,
+    child: Child,
     stdin: tokio::process::ChildStdin,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
 }
@@ -159,7 +159,7 @@ impl StdioTransport {
         let stdout_lines = BufReader::new(stdout).lines();
 
         Ok(Self {
-            _child: child,
+            child,
             stdin,
             stdout_lines,
         })
@@ -235,6 +235,9 @@ impl McpTransportConn for StdioTransport {
 
     async fn close(&mut self) -> Result<()> {
         let _ = self.stdin.shutdown().await;
+
+        // Await termination so the OS reaps the process descriptor slot immediately
+        let _ = self.child.wait().await;
         Ok(())
     }
 }
@@ -1710,5 +1713,73 @@ mod tests {
         assert_eq!(found_val.unwrap(), "config_val");
 
         Ok(())
+    }
+}
+
+// ── Stdio transport lifecycle & process reaping ───────────────────────────
+
+#[tokio::test]
+async fn stdio_transport_leaves_zombie_if_not_explicitly_awaited() {
+    let config = McpServerConfig {
+        name: "test-zombie-leak".into(),
+        transport: McpTransport::Stdio,
+        command: "sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        ..Default::default()
+    };
+
+    let mut transport = StdioTransport::new(&config).expect("Failed to initialize transport");
+
+    #[cfg(target_os = "linux")]
+    let pid = transport.child.id().expect("Valid PID required");
+
+    // Simulate the old bugged behavior: only shut down stdin, no wait loop
+    use tokio::io::AsyncWriteExt;
+    let _ = transport.stdin.shutdown().await;
+
+    #[cfg(target_os = "linux")]
+    {
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        let proc_path = std::path::Path::new(&format!("/proc/{}", pid));
+        assert!(
+            proc_path.exists(),
+            "Without calling wait(), the process should linger as a zombie entry in /proc"
+        );
+    }
+
+    // Clean up resource so we don't leak it during the test execution
+    let _ = transport.child.wait().await;
+}
+
+#[tokio::test]
+async fn stdio_transport_close_reaps_process_instantly() {
+    let config = McpServerConfig {
+        name: "test-clean-reap".into(),
+        transport: McpTransport::Stdio,
+        command: "sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        ..Default::default()
+    };
+
+    let mut transport = StdioTransport::new(&config).expect("Failed to initialize transport");
+
+    #[cfg(target_os = "linux")]
+    let pid = transport.child.id().expect("Valid PID required");
+
+    // Invoke the updated close logic containing our new wait call
+    transport
+        .close()
+        .await
+        .expect("StdioTransport failed to close cleanly");
+
+    #[cfg(target_os = "linux")]
+    {
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        let proc_path = std::path::Path::new(&format!("/proc/{}", pid));
+        assert!(
+            !proc_path.exists(),
+            "Process PID {} should be completely purged from /proc by close()",
+            pid
+        );
     }
 }
