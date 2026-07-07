@@ -21,6 +21,9 @@ const ALLOWED_GIT_ENV_VARS: &[&str] = &[
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
+    // --- Configuration Overrides ---
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
     // --- Authentication & Protocol Overrides ---
     "GIT_ASKPASS",
     "GIT_SSH_COMMAND",
