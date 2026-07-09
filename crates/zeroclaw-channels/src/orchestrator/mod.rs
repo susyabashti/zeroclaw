@@ -9984,6 +9984,14 @@ pub async fn start_channels(
                 model: mcp_model,
                 =>
                 async {
+                    let runtime_context = config
+                        .agent(agent_alias)
+                        .map(|a| a.runtime_context.clone())
+                        .unwrap_or_default();
+                    let runtime_secrets = config
+                        .agent(agent_alias)
+                        .map(|a| a.runtime_secrets.clone())
+                        .unwrap_or_default();
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -9992,7 +10000,7 @@ pub async fn start_channels(
                             agent_mcp_servers.len()
                         )
                     );
-                    match zeroclaw_runtime::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                    match zeroclaw_runtime::tools::McpRegistry::connect_all(&agent_mcp_servers, &runtime_context, &runtime_secrets).await {
                         Ok(registry) => {
                             let registry = std::sync::Arc::new(registry);
                             ch_mcp_elevation_arcs =

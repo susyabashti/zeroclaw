@@ -1,6 +1,7 @@
 //! MCP transport abstraction — supports stdio, SSE, and HTTP transports.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -112,9 +113,15 @@ pub struct StdioTransport {
 }
 
 impl StdioTransport {
-    pub fn new(config: &McpServerConfig) -> Result<Self> {
+    pub fn new(
+        config: &McpServerConfig,
+        runtime_context: &HashMap<String, String>,
+        runtime_secrets: &HashMap<String, String>,
+    ) -> Result<Self> {
         let mut child = Command::new(&config.command)
             .args(&config.args)
+            .envs(runtime_context)
+            .envs(runtime_secrets)
             .envs(&config.env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1106,9 +1113,17 @@ impl McpTransportConn for SseTransport {
 // ── Factory ──────────────────────────────────────────────────────────────
 
 /// Create a transport based on config.
-pub fn create_transport(config: &McpServerConfig) -> Result<Box<dyn McpTransportConn>> {
+pub fn create_transport(
+    config: &McpServerConfig,
+    runtime_context: &HashMap<String, String>,
+    runtime_secrets: &HashMap<String, String>,
+) -> Result<Box<dyn McpTransportConn>> {
     match config.transport {
-        McpTransport::Stdio => Ok(Box::new(StdioTransport::new(config)?)),
+        McpTransport::Stdio => Ok(Box::new(StdioTransport::new(
+            config,
+            runtime_context,
+            runtime_secrets,
+        )?)),
         McpTransport::Http => Ok(Box::new(HttpTransport::new(config)?)),
         McpTransport::Sse => Ok(Box::new(SseTransport::new(config)?)),
     }
@@ -1470,7 +1485,7 @@ mod tests {
             command: "/usr/bin/zeroclaw_nonexistent_binary_abc123".into(),
             ..Default::default()
         };
-        let result = create_transport(&config);
+        let result = create_transport(&config, &HashMap::new(), &HashMap::new());
         assert!(result.is_err());
     }
 
@@ -1481,7 +1496,7 @@ mod tests {
             transport: McpTransport::Http,
             ..Default::default()
         };
-        assert!(create_transport(&config).is_err());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_err());
     }
 
     #[test]
@@ -1491,7 +1506,7 @@ mod tests {
             transport: McpTransport::Sse,
             ..Default::default()
         };
-        assert!(create_transport(&config).is_err());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_err());
     }
 
     #[test]
@@ -1503,7 +1518,7 @@ mod tests {
             ..Default::default()
         };
         // Build should succeed even if server isn't running
-        assert!(create_transport(&config).is_ok());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_ok());
     }
 
     #[test]
@@ -1514,7 +1529,7 @@ mod tests {
             url: Some("http://localhost:9999/sse".into()),
             ..Default::default()
         };
-        assert!(create_transport(&config).is_ok());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_ok());
     }
 
     // ── HTTP session id whitespace handling ───────────────────────────────────
@@ -1676,6 +1691,46 @@ mod tests {
         assert!(guard.message_url.is_none());
         assert!(!guard.message_url_from_endpoint);
         assert!(guard.pending.is_empty());
+    }
+
+    // ── stdio env precedence ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_env_precedence() -> Result<()> {
+        let mut runtime_context = HashMap::new();
+        runtime_context.insert("KEY".to_string(), "context_val".to_string());
+
+        let mut runtime_secrets = HashMap::new();
+        runtime_secrets.insert("KEY".to_string(), "secret_val".to_string());
+
+        let mut config_env = HashMap::new();
+        config_env.insert("KEY".to_string(), "config_val".to_string());
+
+        let config = McpServerConfig {
+            name: "test-server".to_string(),
+            command: "env".to_string(), // The 'env' command prints all vars
+            args: vec![],
+            env: config_env,
+            transport: McpTransport::Stdio,
+            ..Default::default()
+        };
+
+        // 2. Initialize transport
+        let mut transport = StdioTransport::new(&config, &runtime_context, &runtime_secrets)?;
+
+        // 3. Read output from the 'env' command
+        let mut found_val = None;
+        while let Ok(line) = transport.recv_raw().await {
+            if line.starts_with("KEY=") {
+                found_val = Some(line.trim_start_matches("KEY=").to_string());
+                break;
+            }
+        }
+
+        // 4. Verify precedence (Config > Secrets > Context)
+        assert_eq!(found_val.unwrap(), "config_val");
+
+        Ok(())
     }
 }
 
