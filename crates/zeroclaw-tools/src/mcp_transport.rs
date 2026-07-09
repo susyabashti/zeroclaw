@@ -1746,7 +1746,8 @@ async fn stdio_transport_leaves_zombie_if_not_explicitly_awaited() {
         ..Default::default()
     };
 
-    let mut transport = StdioTransport::new(&config, , &HashMap::new(), &HashMap::new()).expect("Failed to initialize transport");
+    let mut transport = StdioTransport::new(&config, &HashMap::new(), &HashMap::new())
+        .expect("Failed to initialize transport");
 
     #[cfg(target_os = "linux")]
     let pid = transport
@@ -1785,7 +1786,8 @@ async fn stdio_transport_close_reaps_process_instantly() {
         ..Default::default()
     };
 
-    let mut transport = StdioTransport::new(&config, , &HashMap::new(), &HashMap::new()).expect("Failed to initialize transport");
+    let mut transport = StdioTransport::new(&config, &HashMap::new(), &HashMap::new())
+        .expect("Failed to initialize transport");
 
     #[cfg(target_os = "linux")]
     let pid = transport
@@ -1850,7 +1852,8 @@ async fn stdio_transport_drop_reaps_process_implicitly() {
     // On non-Linux platforms, we just verify that the lifecycle doesn't crash or panic when dropped.
     #[cfg(not(target_os = "linux"))]
     {
-        let _transport = StdioTransport::new(&config, &HashMap::new(), &HashMap::new()).expect("Failed to initialize transport");
+        let _transport = StdioTransport::new(&config, &HashMap::new(), &HashMap::new())
+            .expect("Failed to initialize transport");
         // falls out of scope implicitly here
     }
 }
