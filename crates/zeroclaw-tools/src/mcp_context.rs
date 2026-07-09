@@ -128,6 +128,8 @@ pub fn render_prompt_messages(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::mcp_client::McpRegistry;
     use crate::mcp_prompt::{McpGetPromptResult, McpPromptMessage};
