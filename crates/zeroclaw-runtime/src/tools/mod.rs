@@ -1640,7 +1640,11 @@ mod tests {
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
         use zeroclaw_tools::tool_search::ToolAccessPolicy;
-        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+        let registry = std::sync::Arc::new(
+            McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
+                .await
+                .unwrap(),
+        );
 
         // No policy → both tools present.
         let both = build_mcp_capability_tools(&registry, None);
