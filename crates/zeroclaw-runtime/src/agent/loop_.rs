@@ -13517,7 +13517,7 @@ Let me check the result."#;
 
     async fn make_deferred_set(names: &[&str]) -> crate::tools::DeferredMcpToolSet {
         let registry = Arc::new(
-            crate::tools::McpRegistry::connect_all(&[])
+            crate::tools::McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
                 .await
                 .expect("empty MCP registry connects"),
         );
