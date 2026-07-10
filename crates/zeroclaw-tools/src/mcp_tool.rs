@@ -93,6 +93,8 @@ impl Tool for McpToolWrapper {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use serde_json::json;
 
@@ -106,7 +108,7 @@ mod tests {
 
     async fn empty_registry() -> Arc<McpRegistry> {
         Arc::new(
-            McpRegistry::connect_all(&[])
+            McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
                 .await
                 .expect("empty connect_all should succeed"),
         )

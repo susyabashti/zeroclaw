@@ -1513,9 +1513,25 @@ impl SecurityPolicy {
                             || arg.starts_with("alias.")
                     })
             }
-            "python" | "python3" => !args
-                .iter()
-                .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
+            "python" | "python3" => {
+                let mut is_unsafe = false;
+
+                for arg in args {
+                    // 1. If an actual module/eval flag is passed to the python interpreter, block it
+                    if arg.starts_with("-c") || arg.starts_with("-m") {
+                        is_unsafe = true;
+                        break;
+                    }
+
+                    // 2. Stop checking the moment we hit the script file or a bare argument.
+                    // Python ignores its own -m/-c flags after this boundary.
+                    if arg.ends_with(".py") {
+                        break;
+                    }
+                }
+
+                !is_unsafe
+            }
             "node" => {
                 // -e/--eval evaluates argument as JavaScript
                 // -p/--print same as --eval but prints the result
