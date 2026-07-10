@@ -263,6 +263,17 @@ impl ScopedToolRegistry {
                     )
                 );
             }
+
+            // Resolve runtime context and secrets from the agent config, if available.
+            let runtime_context = config
+                .agent(agent_alias)
+                .map(|a| a.runtime_context.clone())
+                .unwrap_or_default();
+            let runtime_secrets = config
+                .agent(agent_alias)
+                .map(|a| a.runtime_secrets.clone())
+                .unwrap_or_default();
+
             // Caller-supplied registry wins: the daemon heartbeat worker
             // constructs the registry once and reuses it across every
             // tick so stdio MCP children live for the daemon lifetime.
@@ -272,7 +283,13 @@ impl ScopedToolRegistry {
                 if let Some(shared) = overrides_mcp_registry.as_ref() {
                     Some(Arc::clone(shared))
                 } else {
-                    match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                    match tools::McpRegistry::connect_all(
+                        &agent_mcp_servers,
+                        &runtime_context,
+                        &runtime_secrets,
+                    )
+                    .await
+                    {
                         Ok(registry) => Some(Arc::new(registry)),
                         Err(err) => {
                             // Non-fatal (the assembly proceeds without MCP), but an ERROR

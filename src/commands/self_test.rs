@@ -200,6 +200,7 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
             Ok(p) => std::sync::Arc::new(p),
             Err(e) => return CheckResult::fail("tools", format!("agent {alias}: {e}")),
         };
+
         let tools = crate::tools::default_tools(security);
         if tools.is_empty() {
             return CheckResult::fail("tools", format!("agent {alias}: no tools registered"));

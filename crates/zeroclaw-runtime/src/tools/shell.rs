@@ -94,6 +94,10 @@ pub struct ShellTool {
     /// even though the daemon itself may have a stripped-down env.
     tui_env: Option<HashMap<String, String>>,
     persistent_writes: bool,
+    // Runtime context and secrets are forwarded from the agent config to the shell tool.
+    runtime_context: HashMap<String, String>,
+    // Runtime secrets are forwarded from the agent config to the shell tool.
+    runtime_secrets: HashMap<String, String>,
 }
 
 impl ShellTool {
@@ -106,6 +110,8 @@ impl ShellTool {
             timeout_secs,
             tui_env: None,
             persistent_writes: true,
+            runtime_context: HashMap::new(),
+            runtime_secrets: HashMap::new(),
         }
     }
 
@@ -122,6 +128,8 @@ impl ShellTool {
             timeout_secs,
             tui_env: None,
             persistent_writes: true,
+            runtime_context: HashMap::new(),
+            runtime_secrets: HashMap::new(),
         }
     }
 
@@ -141,6 +149,16 @@ impl ShellTool {
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
         self.tui_env = env;
+        self
+    }
+
+    pub fn with_runtime_context(mut self, context: HashMap<String, String>) -> Self {
+        self.runtime_context = context;
+        self
+    }
+
+    pub fn with_runtime_secrets(mut self, secrets: HashMap<String, String>) -> Self {
+        self.runtime_secrets = secrets;
         self
     }
 }
@@ -327,9 +345,32 @@ impl Tool for ShellTool {
 
         cmd.env_clear();
 
-        for var in collect_allowed_shell_env_vars(&self.security) {
-            if let Ok(val) = std::env::var(&var) {
-                cmd.env(&var, val);
+        // 1. Collect the allowed keys into a HashSet for O(1) lookups
+        use std::collections::HashSet;
+        let allowed_vars: HashSet<String> = collect_allowed_shell_env_vars(&self.security)
+            .into_iter()
+            .collect();
+
+        // 2. Pull from the host system's environment, still respecting the allowed list
+        for var in &allowed_vars {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+
+        // 3. Only inject runtime_context if the key is in the allowed list
+        // (Note: runtime_context takes precedence over system env vars, so they're injected first)
+        for (key, val) in &self.runtime_context {
+            if allowed_vars.contains(key) {
+                cmd.env(key, val);
+            }
+        }
+
+        // 4. Only inject runtime_secrets if the key is in the allowed list
+        // (Note: runtime_secrets take precedence over runtime_context, so they're injected last)
+        for (key, val) in &self.runtime_secrets {
+            if allowed_vars.contains(key) {
+                cmd.env(key, val);
             }
         }
 
@@ -1161,6 +1202,86 @@ mod tests {
         assert!(vars.contains(&"ALSO_VALID".to_string()));
         assert!(!vars.contains(&"BAD-NAME".to_string()));
         assert!(!vars.contains(&"1NOPE".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_allows_configured_runtime_context_and_secrets() {
+        // Prepare runtime variables
+        let mut context = HashMap::new();
+        context.insert("ALLOWED_CONTEXT".to_string(), "ctx_val".to_string());
+        context.insert("BLOCKED_CONTEXT".to_string(), "hidden_ctx".to_string());
+
+        let mut secrets = HashMap::new();
+        secrets.insert("ALLOWED_SECRET".to_string(), "secret_val".to_string());
+        secrets.insert("BLOCKED_SECRET".to_string(), "hidden_secret".to_string());
+
+        // We ONLY allow ALLOWED_CONTEXT and ALLOWED_SECRET in the passthrough configuration
+        let tool = ShellTool::new(
+            test_security_with_env_passthrough(&["ALLOWED_CONTEXT", "ALLOWED_SECRET"]),
+            test_runtime(),
+        )
+        .with_runtime_context(context)
+        .with_runtime_secrets(secrets);
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+
+        // 1. Allowed vars should be explicitly visible
+        assert!(env_output_contains_assignment(
+            &result.output,
+            "ALLOWED_CONTEXT",
+            "ctx_val"
+        ));
+        assert!(env_output_contains_assignment(
+            &result.output,
+            "ALLOWED_SECRET",
+            "secret_val"
+        ));
+
+        // 2. Blocked vars must NOT be present in the tool's environment output
+        // (Assuming you have a helper or can just assert !contains)
+        assert!(!result.output.contains("BLOCKED_CONTEXT"));
+        assert!(!result.output.contains("BLOCKED_SECRET"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_runtime_vars_override_system_env_with_correct_precedence() {
+        // Lowest Priority: Host System Environment
+        let _guard = EnvGuard::set("OVERRIDE_ME", "system_level_value");
+
+        // Medium Priority: Runtime Context
+        let mut context = HashMap::new();
+        context.insert("OVERRIDE_ME".to_string(), "context_level_value".to_string());
+
+        // Highest Priority: Runtime Secrets
+        let mut secrets = HashMap::new();
+        secrets.insert("OVERRIDE_ME".to_string(), "secret_wins_value".to_string());
+
+        // Whitelist the key so it's allowed through all loops
+        let tool = ShellTool::new(
+            test_security_with_env_passthrough(&["OVERRIDE_ME"]),
+            test_runtime(),
+        )
+        .with_runtime_context(context)
+        .with_runtime_secrets(secrets);
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+
+        // Assert that the highest priority (secret) successfully completely overwrote the others
+        assert!(env_output_contains_assignment(
+            &result.output,
+            "OVERRIDE_ME",
+            "secret_wins_value"
+        ));
     }
 
     #[tokio::test]

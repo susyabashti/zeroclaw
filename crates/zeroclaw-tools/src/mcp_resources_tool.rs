@@ -145,10 +145,14 @@ impl Tool for McpResourcesTool {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     async fn empty_registry() -> Arc<McpRegistry> {
-        Arc::new(McpRegistry::connect_all(&[]).await.unwrap())
+        Arc::new(
+            McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
+                .await
+                .unwrap(),
+        )
     }
 
     #[tokio::test]

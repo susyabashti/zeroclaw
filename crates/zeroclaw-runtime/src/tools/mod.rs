@@ -555,6 +555,15 @@ pub fn all_tools_with_runtime(
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    let runtime_context = config
+        .agent(agent_alias)
+        .map(|a| a.runtime_context.clone())
+        .unwrap_or_default();
+    let runtime_secrets = config
+        .agent(agent_alias)
+        .map(|a| a.runtime_secrets.clone())
+        .unwrap_or_default();
+
     // Keep a shared runtime adapter available after constructing ShellTool.
     // Independent agentic delegates use it later to build the target-owned tool
     // registry; bounded delegates continue to use the parent `tool_arcs`
@@ -569,6 +578,8 @@ pub fn all_tools_with_runtime(
                         root_config.shell_tool.timeout_secs
                     })
                     .with_tui_env(tui_env)
+                    .with_runtime_context(runtime_context.clone())
+                    .with_runtime_secrets(runtime_secrets.clone())
                     .with_persistent_writes(persistent_writes),
                 security.clone(),
             ),
@@ -645,10 +656,11 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
+        Arc::new(
+            GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())
+                .with_runtime_context(runtime_context.clone())
+                .with_runtime_secrets(runtime_secrets.clone()),
+        ),
         Arc::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
@@ -1581,7 +1593,11 @@ mod tests {
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
         use zeroclaw_tools::tool_search::ToolAccessPolicy;
-        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+        let registry = std::sync::Arc::new(
+            McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
+                .await
+                .unwrap(),
+        );
 
         // No policy → both tools present.
         let both = build_mcp_capability_tools(&registry, None);

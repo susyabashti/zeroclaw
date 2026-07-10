@@ -1093,6 +1093,17 @@ async fn connect_heartbeat_mcp_registry(
         // caller's existing registry is left exactly as it was.
         return Ok(None);
     }
+
+    // Resolve runtime context and secrets from the agent config, if available.
+    let runtime_context = config
+        .agent(agent_alias)
+        .map(|a| a.runtime_context.clone())
+        .unwrap_or_default();
+    let runtime_secrets = config
+        .agent(agent_alias)
+        .map(|a| a.runtime_secrets.clone())
+        .unwrap_or_default();
+
     // Fail-open, mirroring the per-run `agent::run` MCP path: a
     // granted MCP server being unreachable must NOT take the
     // heartbeat worker down under supervisor backoff. On connect
@@ -1102,7 +1113,8 @@ async fn connect_heartbeat_mcp_registry(
     // the "construct the registry once per worker" guarantee
     // still holds whenever the registry IS reachable — the healthy
     // case this targets.
-    match crate::tools::McpRegistry::connect_all(&servers).await {
+    match crate::tools::McpRegistry::connect_all(&servers, &runtime_context, &runtime_secrets).await
+    {
         Ok(registry) => Ok(Some(std::sync::Arc::new(registry))),
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -3206,6 +3218,7 @@ mod tests {
     //    and the Arc pointers would differ on every tick.
     #[tokio::test]
     async fn heartbeat_mcp_registry_constructed_once_across_n_ticks() {
+        use std::collections::HashMap;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3223,7 +3236,7 @@ mod tests {
         // observe it.
         let construct_count = Arc::new(AtomicUsize::new(0));
         let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
-            crate::tools::McpRegistry::connect_all(&[])
+            crate::tools::McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
                 .await
                 .expect("empty connect_all succeeds for the test fixture"),
         );
@@ -3550,6 +3563,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_mcp_shared_arc_survives_n_tick_drops() {
+        use std::collections::HashMap;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3562,7 +3576,7 @@ mod tests {
         // stays installed across every simulated tick.
         let construct_count = Arc::new(AtomicUsize::new(0));
         let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
-            crate::tools::McpRegistry::connect_all(&[])
+            crate::tools::McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
                 .await
                 .expect("empty connect_all succeeds"),
         );
@@ -3629,6 +3643,7 @@ mod tests {
     // construction/connect counter, not the call counter.
     #[tokio::test]
     async fn heartbeat_worker_reuses_shared_mcp_registry_across_n_ticks() {
+        use std::collections::HashMap;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3643,7 +3658,7 @@ mod tests {
         // concurrent regression test cannot clobber it.
         let construct_count = Arc::new(AtomicUsize::new(0));
         let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
-            crate::tools::McpRegistry::connect_all(&[])
+            crate::tools::McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
                 .await
                 .expect("empty connect_all succeeds"),
         );
@@ -3739,6 +3754,7 @@ mod tests {
     //    the daemon worker only calls it once.
     #[tokio::test]
     async fn connect_heartbeat_mcp_registry_helper_counts_per_invocation() {
+        use std::collections::HashMap;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3748,7 +3764,7 @@ mod tests {
 
         let construct_count = Arc::new(AtomicUsize::new(0));
         let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
-            crate::tools::McpRegistry::connect_all(&[])
+            crate::tools::McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
                 .await
                 .expect("empty connect_all succeeds"),
         );
@@ -3928,6 +3944,7 @@ mod tests {
     /// not reach on its own.
     #[tokio::test]
     async fn retry_heartbeat_mcp_registry_never_resubmits_healthy_peer_across_ticks() {
+        use std::collections::HashMap;
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig};
 
         let a_handle = make_test_server_handle("server-a");
@@ -3964,7 +3981,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let requested_for_hook = std::sync::Arc::clone(&requested);
         let empty_registry: std::sync::Arc<crate::tools::McpRegistry> = std::sync::Arc::new(
-            crate::tools::McpRegistry::connect_all(&[])
+            crate::tools::McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
                 .await
                 .expect("empty connect_all succeeds"),
         );
