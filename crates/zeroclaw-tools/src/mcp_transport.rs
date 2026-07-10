@@ -1,6 +1,7 @@
 //! MCP transport abstraction — supports stdio, SSE, and HTTP transports.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -106,15 +107,21 @@ pub trait McpTransportConn: Send + Sync {
 
 /// Stdio-based transport (spawn local process).
 pub struct StdioTransport {
-    _child: Child,
+    child: Option<Child>,
     stdin: tokio::process::ChildStdin,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
 }
 
 impl StdioTransport {
-    pub fn new(config: &McpServerConfig) -> Result<Self> {
+    pub fn new(
+        config: &McpServerConfig,
+        runtime_context: &HashMap<String, String>,
+        runtime_secrets: &HashMap<String, String>,
+    ) -> Result<Self> {
         let mut child = Command::new(&config.command)
             .args(&config.args)
+            .envs(runtime_context)
+            .envs(runtime_secrets)
             .envs(&config.env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -152,7 +159,7 @@ impl StdioTransport {
         let stdout_lines = BufReader::new(stdout).lines();
 
         Ok(Self {
-            _child: child,
+            child: Some(child),
             stdin,
             stdout_lines,
         })
@@ -228,7 +235,28 @@ impl McpTransportConn for StdioTransport {
 
     async fn close(&mut self) -> Result<()> {
         let _ = self.stdin.shutdown().await;
+
+        // Await termination so the OS reaps the process descriptor slot immediately
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait().await;
+        }
         Ok(())
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        // If close() was already called, child will be None and this is a clean no-op
+        if let Some(mut child) = self.child.take() {
+            // Check if the process has already exited and reap it immediately if so
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+
+            // Otherwise, make sure it's killed and try a quick non-blocking reap
+            let _ = child.start_kill();
+            let _ = child.try_wait();
+        }
     }
 }
 
@@ -1085,9 +1113,17 @@ impl McpTransportConn for SseTransport {
 // ── Factory ──────────────────────────────────────────────────────────────
 
 /// Create a transport based on config.
-pub fn create_transport(config: &McpServerConfig) -> Result<Box<dyn McpTransportConn>> {
+pub fn create_transport(
+    config: &McpServerConfig,
+    runtime_context: &HashMap<String, String>,
+    runtime_secrets: &HashMap<String, String>,
+) -> Result<Box<dyn McpTransportConn>> {
     match config.transport {
-        McpTransport::Stdio => Ok(Box::new(StdioTransport::new(config)?)),
+        McpTransport::Stdio => Ok(Box::new(StdioTransport::new(
+            config,
+            runtime_context,
+            runtime_secrets,
+        )?)),
         McpTransport::Http => Ok(Box::new(HttpTransport::new(config)?)),
         McpTransport::Sse => Ok(Box::new(SseTransport::new(config)?)),
     }
@@ -1449,7 +1485,7 @@ mod tests {
             command: "/usr/bin/zeroclaw_nonexistent_binary_abc123".into(),
             ..Default::default()
         };
-        let result = create_transport(&config);
+        let result = create_transport(&config, &HashMap::new(), &HashMap::new());
         assert!(result.is_err());
     }
 
@@ -1460,7 +1496,7 @@ mod tests {
             transport: McpTransport::Http,
             ..Default::default()
         };
-        assert!(create_transport(&config).is_err());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_err());
     }
 
     #[test]
@@ -1470,7 +1506,7 @@ mod tests {
             transport: McpTransport::Sse,
             ..Default::default()
         };
-        assert!(create_transport(&config).is_err());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_err());
     }
 
     #[test]
@@ -1482,7 +1518,7 @@ mod tests {
             ..Default::default()
         };
         // Build should succeed even if server isn't running
-        assert!(create_transport(&config).is_ok());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_ok());
     }
 
     #[test]
@@ -1493,7 +1529,7 @@ mod tests {
             url: Some("http://localhost:9999/sse".into()),
             ..Default::default()
         };
-        assert!(create_transport(&config).is_ok());
+        assert!(create_transport(&config, &HashMap::new(), &HashMap::new()).is_ok());
     }
 
     // ── HTTP session id whitespace handling ───────────────────────────────────
@@ -1655,5 +1691,169 @@ mod tests {
         assert!(guard.message_url.is_none());
         assert!(!guard.message_url_from_endpoint);
         assert!(guard.pending.is_empty());
+    }
+
+    // ── stdio env precedence ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_env_precedence() -> Result<()> {
+        let mut runtime_context = HashMap::new();
+        runtime_context.insert("KEY".to_string(), "context_val".to_string());
+
+        let mut runtime_secrets = HashMap::new();
+        runtime_secrets.insert("KEY".to_string(), "secret_val".to_string());
+
+        let mut config_env = HashMap::new();
+        config_env.insert("KEY".to_string(), "config_val".to_string());
+
+        let config = McpServerConfig {
+            name: "test-server".to_string(),
+            command: "env".to_string(), // The 'env' command prints all vars
+            args: vec![],
+            env: config_env,
+            transport: McpTransport::Stdio,
+            ..Default::default()
+        };
+
+        // 2. Initialize transport
+        let mut transport = StdioTransport::new(&config, &runtime_context, &runtime_secrets)?;
+
+        // 3. Read output from the 'env' command
+        let mut found_val = None;
+        while let Ok(line) = transport.recv_raw().await {
+            if line.starts_with("KEY=") {
+                found_val = Some(line.trim_start_matches("KEY=").to_string());
+                break;
+            }
+        }
+
+        // 4. Verify precedence (Config > Secrets > Context)
+        assert_eq!(found_val.unwrap(), "config_val");
+
+        Ok(())
+    }
+}
+
+// ── Stdio transport lifecycle & process reaping ───────────────────────────
+
+#[tokio::test]
+async fn stdio_transport_leaves_zombie_if_not_explicitly_awaited() {
+    let config = McpServerConfig {
+        name: "test-zombie-leak".into(),
+        transport: McpTransport::Stdio,
+        command: "sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        ..Default::default()
+    };
+
+    let mut transport = StdioTransport::new(&config, &HashMap::new(), &HashMap::new())
+        .expect("Failed to initialize transport");
+
+    #[cfg(target_os = "linux")]
+    let pid = transport
+        .child
+        .as_ref()
+        .and_then(|c| c.id())
+        .expect("Valid PID required");
+
+    // Simulate the old bugged behavior: only shut down stdin, bypassing wait/drop
+    use tokio::io::AsyncWriteExt;
+    let _ = transport.stdin.shutdown().await;
+
+    #[cfg(target_os = "linux")]
+    {
+        tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+        let proc_path = std::path::Path::new(&format!("/proc/{}", pid));
+        assert!(
+            proc_path.exists(),
+            "Without calling wait() or dropping the transport, the process should linger as a zombie entry in /proc"
+        );
+    }
+
+    // Clean up resource via explicit wait so we don't leak it during the test execution
+    if let Some(mut child) = transport.child.take() {
+        let _ = child.wait().await;
+    }
+}
+
+#[tokio::test]
+async fn stdio_transport_close_reaps_process_instantly() {
+    let config = McpServerConfig {
+        name: "test-clean-reap".into(),
+        transport: McpTransport::Stdio,
+        command: "sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        ..Default::default()
+    };
+
+    let mut transport = StdioTransport::new(&config, &HashMap::new(), &HashMap::new())
+        .expect("Failed to initialize transport");
+
+    #[cfg(target_os = "linux")]
+    let pid = transport
+        .child
+        .as_ref()
+        .and_then(|c| c.id())
+        .expect("Valid PID required");
+
+    // Invoke the updated close logic containing our new wait call
+    transport
+        .close()
+        .await
+        .expect("StdioTransport failed to close cleanly");
+
+    #[cfg(target_os = "linux")]
+    {
+        tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+        let proc_path = std::path::Path::new(&format!("/proc/{}", pid));
+        assert!(
+            !proc_path.exists(),
+            "Process PID {} should be completely purged from /proc by close()",
+            pid
+        );
+    }
+}
+
+#[tokio::test]
+async fn stdio_transport_drop_reaps_process_implicitly() {
+    let config = McpServerConfig {
+        name: "test-implicit-drop-reap".into(),
+        transport: McpTransport::Stdio,
+        command: "sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        ..Default::default()
+    };
+
+    // If we are on Linux, we track the PID to verify the kernel's process table entry disappears.
+    #[cfg(target_os = "linux")]
+    {
+        let pid;
+        {
+            let transport = StdioTransport::new(&config).expect("Failed to initialize transport");
+            pid = transport
+                .child
+                .as_ref()
+                .and_then(|c| c.id())
+                .expect("Valid PID required");
+            // transport falls out of scope here, triggering implicit Drop
+        }
+
+        // Give the kernel a tiny slice to handle the synchronous reap lifecycle
+        tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+
+        let proc_path = std::path::Path::new(&format!("/proc/{}", pid));
+        assert!(
+            !proc_path.exists(),
+            "Process PID {} should be instantly reaped by the Drop safety net when dropped out of scope",
+            pid
+        );
+    }
+
+    // On non-Linux platforms, we just verify that the lifecycle doesn't crash or panic when dropped.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _transport = StdioTransport::new(&config, &HashMap::new(), &HashMap::new())
+            .expect("Failed to initialize transport");
+        // falls out of scope implicitly here
     }
 }

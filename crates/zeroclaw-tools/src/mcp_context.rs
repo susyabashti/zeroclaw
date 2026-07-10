@@ -128,6 +128,8 @@ pub fn render_prompt_messages(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::mcp_client::McpRegistry;
     use crate::mcp_prompt::{McpGetPromptResult, McpPromptMessage};
@@ -137,7 +139,11 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_section_empty_for_empty_registry() {
-        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+        let registry = std::sync::Arc::new(
+            McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
+                .await
+                .unwrap(),
+        );
         let configs: Vec<McpServerConfig> = vec![];
         let section = build_pinned_resources_section(&registry, &configs, None).await;
         assert!(section.is_empty());
@@ -145,7 +151,11 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_section_skips_unknown_server() {
-        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+        let registry = std::sync::Arc::new(
+            McpRegistry::connect_all(&[], &HashMap::new(), &HashMap::new())
+                .await
+                .unwrap(),
+        );
         // Server is configured with a pin but never connected (empty registry).
         let configs = vec![McpServerConfig {
             name: "ghost".into(),

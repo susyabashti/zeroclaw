@@ -5646,9 +5646,13 @@ mod tests {
                 )
             }],
             registry: Arc::new(
-                zeroclaw_tools::mcp_client::McpRegistry::connect_all(&[])
-                    .await
-                    .unwrap(),
+                zeroclaw_tools::mcp_client::McpRegistry::connect_all(
+                    &[],
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap(),
             ),
         };
         let handle = Arc::clone(&parent_tools);

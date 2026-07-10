@@ -992,6 +992,7 @@ pub async fn run_gateway(
             );
             continue;
         };
+
         let risk_profile = risk_profile.clone();
         let security = match SecurityPolicy::for_agent(&config, &alias) {
             Ok(s) => Arc::new(s),

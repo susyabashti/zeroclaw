@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -11,13 +12,57 @@ use zeroclaw_config::policy::SecurityPolicy;
 pub struct GitOperationsTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: std::path::PathBuf,
+    git_env_overrides: HashMap<String, String>,
 }
+
+const ALLOWED_GIT_ENV_VARS: &[&str] = &[
+    // --- Agent Identity ---
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    // --- Configuration Overrides ---
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    // --- Authentication & Protocol Overrides ---
+    "GIT_ASKPASS",
+    "GIT_SSH_COMMAND",
+    "GIT_HTTP_USER_AGENT",
+    "GITHUB_TOKEN",
+    "GIT_PASSWORD",
+    "GIT_CONFIG_PARAMETERS",
+];
 
 impl GitOperationsTool {
     pub fn new(security: Arc<SecurityPolicy>, workspace_dir: std::path::PathBuf) -> Self {
         Self {
             security,
             workspace_dir,
+            git_env_overrides: HashMap::new(),
+        }
+    }
+
+    // Standard builder signatures so upstream daemon integration remains uniform
+    pub fn with_runtime_context(mut self, context: HashMap<String, String>) -> Self {
+        // Context applied first (lower priority)
+        self.apply_sanitized(context, false);
+        self
+    }
+
+    pub fn with_runtime_secrets(mut self, secrets: HashMap<String, String>) -> Self {
+        // Secrets applied second (higher priority, will overwrite context matching keys)
+        self.apply_sanitized(secrets, true);
+        self
+    }
+
+    // Single source of truth for filtering and hierarchy merging
+    fn apply_sanitized(&mut self, incoming: HashMap<String, String>, overwrite: bool) {
+        for (key, val) in incoming {
+            if ALLOWED_GIT_ENV_VARS.contains(&key.as_str())
+                && (overwrite || !self.git_env_overrides.contains_key(&key))
+            {
+                self.git_env_overrides.insert(key, val);
+            }
         }
     }
 
@@ -206,13 +251,33 @@ impl GitOperationsTool {
         args: &[&str],
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let output = tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(working_dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await?;
+        let mut cmd = tokio::process::Command::new("git");
+
+        cmd.args(args)
+                .current_dir(working_dir)
+                .env("GIT_TERMINAL_PROMPT", "0") // Always secure prompts
+                .stdin(std::process::Stdio::null());
+
+        // `git_env_overrides` holds a pre-filtered, unified map of environment
+        // variables. To enforce ZeroClaw's "Security from Day 0" model, data
+        // filtration and priority merging happen entirely during ingestion inside
+        // the builder functions (`with_runtime_*`).
+        //
+        // This design ensures that:
+        // 1. Strict Memory Hygiene: Any unapproved context or secrets passed from
+        //    the daemon are immediately discarded at the boundary. We never hold
+        //    unvetted or irrelevant sensitive strings in heap memory during the
+        //    lifetime of this tool, drastically reducing the attack surface in
+        //    the event of a process memory inspection or unexpected core dump.
+        // 2. Clear Precedence: Overrides are locked down linearly at construction
+        //    time (System Env < Context < Secrets) so this execution block is
+        //    guaranteed to use a deterministic, immutable state.
+        // =====================================================================
+        for (key, val) in &self.git_env_overrides {
+            cmd.env(key, val);
+        }
+
+        let output = cmd.output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1095,6 +1160,110 @@ mod tests {
             ..SecurityPolicy::default()
         });
         GitOperationsTool::new(security, dir.to_path_buf())
+    }
+
+    #[test]
+    fn git_env_builders_sanitize_and_enforce_precedence() {
+        let tmp = TempDir::new().unwrap();
+
+        // 1. Prepare an ingestion payload containing allowed and forbidden keys
+        let mut context = HashMap::new();
+        context.insert("GIT_AUTHOR_NAME".to_string(), "ContextAuthor".to_string());
+        context.insert(
+            "FORBIDDEN_CONTEXT".to_string(),
+            "MaliciousValue".to_string(),
+        );
+
+        let mut secrets = HashMap::new();
+        // Collision key: Should overwrite context value
+        secrets.insert(
+            "GIT_AUTHOR_NAME".to_string(),
+            "SecretAuthorWins".to_string(),
+        );
+        secrets.insert("GITHUB_TOKEN".to_string(), "gh_token_123".to_string());
+        secrets.insert("FORBIDDEN_SECRET".to_string(), "StealToken".to_string());
+
+        // 2. Build the tool using your chainable fluent builders
+        let tool = test_tool(tmp.path())
+            .with_runtime_context(context)
+            .with_runtime_secrets(secrets);
+
+        // 3. Assert Memory Sanitization & Precedence outcomes
+        // Allowed variable from secrets overrides allowed variable from context
+        assert_eq!(
+            tool.git_env_overrides
+                .get("GIT_AUTHOR_NAME")
+                .map(|s| s.as_str()),
+            Some("SecretAuthorWins")
+        );
+
+        // Allowed variable from secrets that didn't collide is ingested cleanly
+        assert_eq!(
+            tool.git_env_overrides
+                .get("GITHUB_TOKEN")
+                .map(|s| s.as_str()),
+            Some("gh_token_123")
+        );
+
+        // Assert memory boundaries are maintained: unapproved strings were dropped completely
+        assert!(!tool.git_env_overrides.contains_key("FORBIDDEN_CONTEXT"));
+        assert!(!tool.git_env_overrides.contains_key("FORBIDDEN_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn git_command_inherits_and_executes_with_sanitized_overrides() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+
+        // Setup clear customized identity overrides
+        let mut context = HashMap::new();
+        context.insert("GIT_AUTHOR_NAME".to_string(), "Isolated Agent".to_string());
+        context.insert(
+            "GIT_AUTHOR_EMAIL".to_string(),
+            "agent@zeroclaw.internal".to_string(),
+        );
+
+        let mut secrets = HashMap::new();
+        secrets.insert(
+            "GIT_COMMITTER_NAME".to_string(),
+            "Secure Committer".to_string(),
+        );
+        secrets.insert(
+            "GIT_COMMITTER_EMAIL".to_string(),
+            "committer@zeroclaw.internal".to_string(),
+        );
+
+        let tool = test_tool(tmp.path())
+            .with_runtime_context(context)
+            .with_runtime_secrets(secrets);
+
+        // Create a dummy file change to allow an actual git commit
+        std::fs::write(tmp.path().join("change.txt"), b"update").unwrap();
+
+        // Execute real git tracking commands
+        tool.run_git_command(&["add", "change.txt"], tmp.path())
+            .await
+            .unwrap();
+        tool.run_git_command(&["commit", "-m", "verify env injection"], tmp.path())
+            .await
+            .unwrap();
+
+        // Query Git's commit history log to ensure variables altered the operation
+        let log_output = tool
+            .run_git_command(
+                &[
+                    "log",
+                    "-1",
+                    "--pretty=format:Author:%an <%ae> Committer:%cn <%ce>",
+                ],
+                tmp.path(),
+            )
+            .await
+            .unwrap();
+
+        // Verify the injected environment metadata was written seamlessly by the git binary
+        assert!(log_output.contains("Author:Isolated Agent <agent@zeroclaw.internal>"));
+        assert!(log_output.contains("Committer:Secure Committer <committer@zeroclaw.internal>"));
     }
 
     #[test]

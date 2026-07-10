@@ -1684,17 +1684,23 @@ impl SecurityPolicy {
                     })
             }
             "python" | "python3" => {
-                // -c executes arbitrary code from argument string
-                // -m runs any installed module as a script — broad block is intentional:
-                //   -m http.server opens a local exfil vector
-                //   -m pip install double-covers the pip arm
-                //   -m pytest, -m mypy, -m venv are blocked as collateral;
-                //   narrowing to a curated module list is a future option
-                // starts_with covers glued form: python3 -c'code' (one whitespace token)
-                // Ref: https://docs.python.org/3/using/cmdline.html
-                !args
-                    .iter()
-                    .any(|arg| arg.starts_with("-c") || arg.starts_with("-m"))
+                let mut is_unsafe = false;
+
+                for arg in args {
+                    // 1. If an actual module/eval flag is passed to the python interpreter, block it
+                    if arg.starts_with("-c") || arg.starts_with("-m") {
+                        is_unsafe = true;
+                        break;
+                    }
+
+                    // 2. Stop checking the moment we hit the script file or a bare argument.
+                    // Python ignores its own -m/-c flags after this boundary.
+                    if arg.ends_with(".py") {
+                        break;
+                    }
+                }
+
+                !is_unsafe
             }
             "node" => {
                 // -e/--eval evaluates argument as JavaScript
