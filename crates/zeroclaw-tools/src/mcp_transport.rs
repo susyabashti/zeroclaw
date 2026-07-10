@@ -110,6 +110,9 @@ pub struct StdioTransport {
     child: Option<Child>,
     stdin: tokio::process::ChildStdin,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    config: McpServerConfig,
+    runtime_context: HashMap<String, String>,
+    runtime_secrets: HashMap<String, String>,
 }
 
 impl StdioTransport {
@@ -118,6 +121,27 @@ impl StdioTransport {
         runtime_context: &HashMap<String, String>,
         runtime_secrets: &HashMap<String, String>,
     ) -> Result<Self> {
+        let (child, stdin, stdout_lines) = Self::spawn(config, runtime_context, runtime_secrets)?;
+
+        Ok(Self {
+            child: Some(child),
+            stdin,
+            stdout_lines,
+            config: config.clone(),
+            runtime_context: runtime_context.clone(),
+            runtime_secrets: runtime_secrets.clone(),
+        })
+    }
+
+    fn spawn(
+        config: &McpServerConfig,
+        runtime_context: &HashMap<String, String>,
+        runtime_secrets: &HashMap<String, String>,
+    ) -> Result<(
+        Child,
+        tokio::process::ChildStdin,
+        tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    )> {
         let mut child = Command::new(&config.command)
             .args(&config.args)
             .envs(runtime_context)
@@ -158,11 +182,7 @@ impl StdioTransport {
         })?;
         let stdout_lines = BufReader::new(stdout).lines();
 
-        Ok(Self {
-            child: Some(child),
-            stdin,
-            stdout_lines,
-        })
+        Ok((child, stdin, stdout_lines))
     }
 
     async fn send_raw(&mut self, line: &str) -> Result<()> {
@@ -233,6 +253,30 @@ impl McpTransportConn for StdioTransport {
         }
     }
 
+    /// Kill and reap the previous child (this is the step the default
+    /// no-op `reset()` was skipping, letting crashed/broken-pipe children
+    /// accumulate as zombies on every reconnect), then spawn a fresh
+    /// process for the next `send_and_recv`.
+    async fn reset(&mut self) -> Result<()> {
+        if let Some(mut child) = self.child.take() {
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.start_kill();
+            }
+            // Blocking .wait() here (we're already async) guarantees the
+            // reap happens now, not on a best-effort background task.
+            let _ = child.wait().await;
+        }
+
+        let (child, stdin, stdout_lines) =
+            Self::spawn(&self.config, &self.runtime_context, &self.runtime_secrets)
+                .with_context(|| format!("failed to respawn MCP server `{}`", self.config.name))?;
+
+        self.child = Some(child);
+        self.stdin = stdin;
+        self.stdout_lines = stdout_lines;
+        Ok(())
+    }
+
     async fn close(&mut self) -> Result<()> {
         let _ = self.stdin.shutdown().await;
 
@@ -246,16 +290,30 @@ impl McpTransportConn for StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        // If close() was already called, child will be None and this is a clean no-op
         if let Some(mut child) = self.child.take() {
-            // Check if the process has already exited and reap it immediately if so
+            // Already exited and reaped? Nothing to do.
             if let Ok(Some(_)) = child.try_wait() {
                 return;
             }
 
-            // Otherwise, make sure it's killed and try a quick non-blocking reap
             let _ = child.start_kill();
-            let _ = child.try_wait();
+
+            // start_kill() only sends the signal; it does not reap. We must
+            // still `.wait()` on the child or it stays a zombie until someone
+            // does. Drop is sync, so spawn a task to finish the job.
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        let _ = child.wait().await;
+                    });
+                }
+                Err(_) => {
+                    // No runtime available (e.g. dropping during process
+                    // shutdown outside a tokio context). Best effort only —
+                    // can't reap async here.
+                    let _ = child.try_wait();
+                }
+            }
         }
     }
 }
