@@ -1081,6 +1081,238 @@ mod tests {
 
     use super::*;
 
+    fn authoring_sop(steps: Vec<SopStep>) -> Sop {
+        Sop {
+            name: "authoring".into(),
+            description: "test".into(),
+            version: "0.1.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps,
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: None,
+        }
+    }
+
+    fn titled_step(number: u32, title: &str) -> SopStep {
+        SopStep {
+            number,
+            title: title.to_string(),
+            ..SopStep::default()
+        }
+    }
+
+    #[test]
+    fn normalize_step_numbers_remaps_all_references() {
+        let mut s3 = titled_step(30, "c");
+        s3.routing.next = Some(10);
+        s3.routing.depends_on = vec![20, 99];
+        s3.routing.switch = vec![SwitchRule {
+            name: "port".into(),
+            when: None,
+            goto: Some(20),
+        }];
+        s3.on_failure = StepFailure::Goto { step: 10 };
+        let mut sop = authoring_sop(vec![titled_step(10, "a"), titled_step(20, "b"), s3]);
+
+        normalize_step_numbers(&mut sop);
+
+        let numbers: Vec<u32> = sop.steps.iter().map(|s| s.number).collect();
+        assert_eq!(numbers, vec![1, 2, 3]);
+        assert_eq!(sop.steps[2].routing.next, Some(1));
+        assert_eq!(
+            sop.steps[2].routing.depends_on,
+            vec![2],
+            "dangling ref 99 dropped"
+        );
+        assert_eq!(sop.steps[2].routing.switch[0].goto, Some(2));
+        assert_eq!(sop.steps[2].on_failure, StepFailure::Goto { step: 1 });
+    }
+
+    #[test]
+    fn normalize_step_numbers_refuses_duplicate_numbers() {
+        let mut sop = authoring_sop(vec![titled_step(1, "a"), titled_step(1, "b")]);
+        let before = sop.steps.clone();
+        normalize_step_numbers(&mut sop);
+        assert_eq!(
+            sop.steps, before,
+            "ambiguous numbering must not be remapped"
+        );
+    }
+
+    #[test]
+    fn normalize_dangling_failure_goto_falls_back_to_fail() {
+        let mut s1 = titled_step(1, "a");
+        s1.on_failure = StepFailure::Goto { step: 99 };
+        let mut sop = authoring_sop(vec![s1]);
+        normalize_step_numbers(&mut sop);
+        assert_eq!(sop.steps[0].on_failure, StepFailure::Fail);
+    }
+
+    #[test]
+    fn render_parse_roundtrip_preserves_full_step_contract() {
+        let mut step = titled_step(1, "Collect");
+        step.body = "Gather context.".into();
+        step.suggested_tools = vec!["read_file".into(), "shell".into()];
+        step.requires_confirmation = true;
+        step.kind = SopStepKind::Checkpoint;
+        step.schema = Some(StepSchema {
+            input: Some(json!({"type": "object", "required": ["ticket"]})),
+            output: Some(json!({"type": "boolean"})),
+        });
+        step.scope = Some(crate::sop::scope::StepToolScope {
+            allow: Some(vec!["fs".into()]),
+            deny: vec!["shell".into()],
+        });
+        step.routing = StepRouting {
+            when: Some("$.steps.1.ok == true".into()),
+            next: Some(2),
+            terminal: false,
+            depends_on: vec![2],
+            switch: vec![
+                SwitchRule {
+                    name: "pr".into(),
+                    when: Some("$.event".into()),
+                    goto: Some(2),
+                },
+                SwitchRule {
+                    name: "catch_all".into(),
+                    when: None,
+                    goto: None,
+                },
+            ],
+        };
+        step.on_failure = StepFailure::Retry { max: 2 };
+        step.mode = Some(SopExecutionMode::Auto);
+
+        let mut terminal = titled_step(2, "Done");
+        terminal.routing.terminal = true;
+
+        let rendered = render_steps(&[step.clone(), terminal.clone()]);
+        let parsed = parse_steps(&rendered);
+
+        assert_eq!(parsed, vec![step, terminal]);
+    }
+
+    #[test]
+    fn save_sop_rejects_blocking_validation_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "")]);
+        let err = save_sop(dir.path(), &sop).unwrap_err();
+        assert!(err.to_string().contains("SOP rejected"));
+        assert!(!dir.path().join("authoring").exists());
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_via_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s1 = titled_step(1, "First");
+        s1.body = "Do the thing.".into();
+        s1.routing.next = Some(2);
+        let sop = authoring_sop(vec![s1, titled_step(2, "Second")]);
+
+        save_sop(dir.path(), &sop).unwrap();
+
+        let loaded =
+            load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.name, sop.name);
+        assert_eq!(loaded.execution_mode, SopExecutionMode::Auto);
+        assert_eq!(loaded.triggers, sop.triggers);
+        assert_eq!(loaded.steps, sop.steps);
+
+        delete_sop(dir.path(), "authoring").unwrap();
+        assert!(load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).is_err());
+    }
+
+    #[test]
+    fn step_pos_roundtrips_via_toml_and_stays_out_of_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s1 = titled_step(1, "First");
+        s1.body = "Do the thing.".into();
+        s1.pos = Some(types::StepPos { x: 320.5, y: -48.0 });
+        let sop = authoring_sop(vec![s1, titled_step(2, "Second")]);
+
+        save_sop(dir.path(), &sop).unwrap();
+
+        let toml = std::fs::read_to_string(dir.path().join("authoring/SOP.toml")).unwrap();
+        assert!(
+            toml.contains("[[positions]]"),
+            "positions block in TOML: {toml}"
+        );
+        let md = std::fs::read_to_string(dir.path().join("authoring/SOP.md")).unwrap();
+        assert!(
+            !md.contains("320.5"),
+            "coordinate must not leak into SOP.md: {md}"
+        );
+
+        let loaded =
+            load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(
+            loaded.steps[0].pos,
+            Some(types::StepPos { x: 320.5, y: -48.0 })
+        );
+        assert_eq!(loaded.steps[1].pos, None);
+    }
+
+    #[test]
+    fn sop_name_path_traversal_is_rejected_across_all_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let hostile = [
+            "../escape",
+            "..",
+            ".",
+            "/etc/shadow",
+            "a/b",
+            "a\\b",
+            "../../etc/cron.d/evil",
+            "",
+        ];
+        for name in hostile {
+            assert!(
+                load_sop_by_name(dir.path(), name, SopExecutionMode::Supervised).is_err(),
+                "load must reject {name:?}"
+            );
+            assert!(
+                delete_sop(dir.path(), name).is_err(),
+                "delete must reject {name:?}"
+            );
+            let mut sop = authoring_sop(vec![titled_step(1, "First")]);
+            sop.name = name.into();
+            assert!(
+                save_sop(dir.path(), &sop).is_err(),
+                "save must reject {name:?}"
+            );
+            assert!(
+                create_sop(dir.path(), &sop).is_err(),
+                "create must reject {name:?}"
+            );
+        }
+        let escape = dir.path().parent().unwrap().join("escape");
+        assert!(!escape.exists(), "no write may land outside the SOP root");
+    }
+
+    #[test]
+    fn validate_sop_strict_blocks_graph_errors_and_duplicates() {
+        let mut s1 = titled_step(1, "a");
+        s1.routing.next = Some(99);
+        let validation = validate_sop_strict(&authoring_sop(vec![s1, titled_step(1, "b")]));
+        assert!(!validation.is_ok());
+        assert!(
+            validation
+                .blocking
+                .iter()
+                .any(|b| b.contains("Duplicate step number 1"))
+        );
+        assert!(validation.blocking.iter().any(|b| b.contains("step 99")));
+
+        let ok = validate_sop_strict(&authoring_sop(vec![titled_step(1, "a")]));
+        assert!(ok.is_ok());
+    }
+
     #[test]
     fn resolve_sops_dir_joins_relative_config_value_to_workspace() {
         let workspace = Path::new("/home/user/.zoder/data");

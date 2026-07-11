@@ -73,6 +73,36 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
         return NextStep::Complete;
     }
 
+    // ── Switch: evaluate ports top to bottom; first passing rule routes. A
+    // rule with no `when` is the catch-all. No rule matches → Complete.
+    if !current.routing.switch.is_empty() {
+        let payload = ctx.run_data.to_payload().to_string();
+        for rule in &current.routing.switch {
+            let matched = match rule.when.as_deref() {
+                Some(when) => evaluate_condition(when, Some(&payload)),
+                None => true,
+            };
+            if !matched {
+                continue;
+            }
+            let Some(target) = rule.goto else {
+                return NextStep::Fail(format!("switch port '{}' has no target", rule.name));
+            };
+            let Some(step) = ctx.sop.steps.iter().find(|s| s.number == target) else {
+                return NextStep::Fail(format!("step {target} does not exist"));
+            };
+            if !guard::within_visit_bound(ctx.run, target, ctx.max_step_visits) {
+                return NextStep::Fail(format!("step {target} visit limit reached"));
+            }
+            return if eligible(step, ctx.run_data) {
+                NextStep::Step(target)
+            } else {
+                NextStep::Wait(target)
+            };
+        }
+        return NextStep::Complete;
+    }
+
     let explicit_next = current.routing.next;
     // A failed `when` disables the explicit jump: the step routes as if
     // `next` were absent, so `terminal` still completes the run.

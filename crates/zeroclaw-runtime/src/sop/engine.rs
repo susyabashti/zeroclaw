@@ -493,6 +493,7 @@ impl SopEngine {
                 // a park with no policy `request_route` (e.g. a deterministic checkpoint).
                 self.notify_park_request(&run_id);
             }
+            self.notify_run(run, true);
         }
     }
 
@@ -1988,6 +1989,87 @@ impl SopEngine {
                 Err(e)
             }
         }
+    }
+
+    /// Resolve a checkpoint decision (`PausedCheckpoint`). `Approve` resumes the
+    /// success path (records the checkpoint `Completed`, pipes forward down
+    /// `routing.next`); `Deny` takes the failure path (records the checkpoint
+    /// `Failed` and routes through the step's `on_failure`, exactly like a step
+    /// that failed execution). This is the single entry point for both outcomes;
+    /// callers never branch on status. `approve_step` is the `Approve`-only alias.
+    pub fn decide_checkpoint(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+    ) -> Result<SopRunAction> {
+        match decision {
+            super::approval::ApprovalDecision::Approve => self.approve_step(run_id),
+            super::approval::ApprovalDecision::Deny { reason } => {
+                self.deny_checkpoint(run_id, reason)
+            }
+        }
+    }
+
+    /// Failure path for a denied checkpoint: record the checkpoint step `Failed`
+    /// and route through its `on_failure` policy via the shared deterministic
+    /// record-and-route chokepoint. `Goto` reaches the authored failure step;
+    /// the default `Fail` terminates the run `Failed`. Mirrors `approve_step`'s
+    /// guard so a wrong-status or missing run fails closed with the gate intact.
+    fn deny_checkpoint(&mut self, run_id: &str, reason: Option<String>) -> Result<SopRunAction> {
+        let status = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"run_id": run_id})),
+                    "SOP engine: active run not found"
+                );
+                anyhow::Error::msg(format!("Active run not found: {run_id}"))
+            })?
+            .status;
+
+        if status != SopRunStatus::PausedCheckpoint {
+            bail!("Run {run_id} is not paused at a checkpoint (status: {status})");
+        }
+
+        let (_, sop) = self.resolve_active_run_sop(run_id)?;
+        let current_step_number = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?
+            .current_step;
+        let current_step = self.resolve_sop_step(&sop, current_step_number)?;
+
+        let detail = reason.unwrap_or_else(|| "checkpoint denied by operator".to_string());
+        let now = now_iso8601();
+
+        if let Some(run) = self.active_runs.get_mut(run_id) {
+            run.status = SopRunStatus::Running;
+            run.waiting_since = None;
+        }
+        self.record_transition_event(
+            run_id,
+            "checkpoint_denied",
+            Some(detail.clone()),
+            ::serde_json::json!({
+                "step": current_step.number,
+                "kind": current_step.kind.to_string(),
+            }),
+        );
+
+        self.record_deterministic_step_result(
+            run_id,
+            &sop,
+            &current_step,
+            SopStepStatus::Failed,
+            detail.clone(),
+            serde_json::Value::String(detail),
+            now.clone(),
+            Some(now),
+        )
     }
 
     /// Clear a `WaitingApproval` gate: flip to Running, build the ExecuteStep
@@ -8116,6 +8198,68 @@ type = "manual"
         let mut engine = SopEngine::new(SopConfig::default()).with_store(store);
         engine.restore_runs();
         assert!(engine.active_runs().contains_key("r-restore"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn engine_restores_finished_runs_from_store() {
+        use super::super::store::SqliteRunStore;
+        let path = std::env::temp_dir().join(format!(
+            "zc-sop-engine-restore-fin-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
+
+        // Persist a terminal run: saved active, then finished with a bumped revision.
+        let base = SopRun {
+            run_id: "r-done".to_string(),
+            sop_name: "deploy".to_string(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: now_iso8601(),
+            },
+            frame_marker_id: "marker-done".to_string(),
+            status: SopRunStatus::Running,
+            current_step: 0,
+            total_steps: 1,
+            started_at: now_iso8601(),
+            completed_at: None,
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+        };
+        store
+            .save_run(&PersistedRun::new(
+                base.clone(),
+                now_iso8601(),
+                SopTriggerSource::Manual,
+            ))
+            .unwrap();
+        let mut terminal = base;
+        terminal.status = SopRunStatus::Completed;
+        terminal.completed_at = Some(now_iso8601());
+        let mut persisted = PersistedRun::new(terminal, now_iso8601(), SopTriggerSource::Manual);
+        persisted.revision = 1;
+        store.finish_run("r-done", &persisted).unwrap();
+
+        // A fresh engine seeds its retention window from the store's terminal set.
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store);
+        engine.restore_runs();
+        assert!(
+            !engine.active_runs().contains_key("r-done"),
+            "terminal run must not rehydrate as active"
+        );
+        let finished = engine.finished_runs(None);
+        assert_eq!(
+            finished.len(),
+            1,
+            "terminal run seeded into retention window"
+        );
+        assert_eq!(finished[0].run_id, "r-done");
+        assert_eq!(finished[0].status, SopRunStatus::Completed);
         let _ = std::fs::remove_file(&path);
     }
 
